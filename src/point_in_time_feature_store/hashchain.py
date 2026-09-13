@@ -1,8 +1,10 @@
 """Hash-chained, append-only tables in SQLite (registry change log and feature access audit).
 
 Each entry stores ``entry_hash = SHA-256(canonical JSON of seq, ts_us, actor, action, payload,
-prev_hash)``. Editing, deleting or reordering any entry breaks every later hash; truncating the
-tail is detected by comparing the head against a copy stored elsewhere (``expected_head``).
+prev_hash)``. Editing, deleting or reordering an entry in place breaks every later hash. The chain
+is unkeyed, so a truncated tail, or a chain rebuilt from scratch by someone who can write the
+SQLite file, still verifies on its own; that is detected only against a head kept elsewhere
+(``expected_head``) or a signed anchor (:mod:`point_in_time_feature_store.anchors`).
 """
 
 from __future__ import annotations

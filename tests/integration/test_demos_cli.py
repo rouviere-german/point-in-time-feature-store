@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import runpy
+import sqlite3
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -23,6 +24,7 @@ from point_in_time_feature_store.erasure import ErasureReceipt, ReceiptSigner
 from point_in_time_feature_store.offline.synthetic import churn_feature_repo
 from point_in_time_feature_store.online.acl import validate_acl
 from point_in_time_feature_store.online.store import OnlineStore
+from point_in_time_feature_store.registry import FeatureRegistry
 from point_in_time_feature_store.serving.auth import (
     TokenVerifier,
     load_private_key,
@@ -132,6 +134,54 @@ def test_definition_workflow(tmp_path: Path, capsys: pytest.CaptureFixture[str])
     )
     assert cli.main(["catalog"]) == 0
     assert capsys.readouterr().out == render_catalog(churn_feature_repo())
+
+
+@pytest.mark.usefixtures("restore_logging")
+def test_chain_anchor_commands_detect_truncation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    keys = tmp_path / "keys"
+    assert cli.main(["generate-keys", "--out-dir", str(keys)]) == 0
+    registry_path = tmp_path / "registry.sqlite"
+    registry = FeatureRegistry(registry_path)
+    registry.apply(churn_feature_repo(), actor="alice")
+    for index in range(3):
+        registry.record_access("svc", "online_read", {"entity_count": index})
+    registry.close()
+    base = ["--registry", str(registry_path)]
+    anchor = tmp_path / "anchor.json"
+    signing = ["--signing-key", str(keys / "receipt_private.pem")]
+    assert cli.main(["anchor-chains", *base, *signing, "--out", str(anchor)]) == 0
+    capsys.readouterr()
+    verify = [
+        "verify-chains",
+        *base,
+        "--anchor",
+        str(anchor),
+        "--public-key",
+        str(keys / "receipt_public.pem"),
+    ]
+    assert cli.main(verify) == 0
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert (report["anchored"], report["anchor_signature_valid"]) == (True, True)
+    assert cli.main(["verify-chains", *base, "--anchor", str(anchor)]) == 2
+    assert cli.main(["verify-chains", *base]) == 0
+    assert "truncated tail" in capsys.readouterr().err
+
+    with sqlite3.connect(registry_path) as connection:
+        connection.execute("DELETE FROM access_audit WHERE seq = 3")  # drop the tail
+    assert cli.main(["verify-chains", *base]) == 0  # the bare chain cannot tell
+    capsys.readouterr()
+    assert cli.main(verify) == 1
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert report["access_audit"]["ok"] is False
+    assert report["change_log"]["ok"] is True
+
+    with sqlite3.connect(registry_path) as connection:
+        connection.execute("UPDATE access_audit SET payload = '{}' WHERE seq = 1")
+    refused = tmp_path / "refused.json"
+    assert cli.main(["anchor-chains", *base, *signing, "--out", str(refused)]) == 1
+    assert not refused.exists()
 
 
 @pytest.mark.usefixtures("restore_logging")

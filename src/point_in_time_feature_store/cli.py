@@ -186,23 +186,66 @@ def _verify_receipt(args: argparse.Namespace) -> int:
 
 
 def _verify_chains(args: argparse.Namespace) -> int:
+    from point_in_time_feature_store.anchors import ChainAnchor, verify_anchored
     from point_in_time_feature_store.registry import FeatureRegistry
+    from point_in_time_feature_store.serving.auth import load_public_key
 
+    if (args.anchor is None) != (args.public_key is None):
+        print("--anchor and --public-key must be given together", file=sys.stderr)
+        return 2
     registry = FeatureRegistry(args.registry)
     try:
-        results = registry.verify_chains()
+        if args.anchor is None:
+            results = registry.verify_chains()
+            status: dict[str, bool] = {"anchored": False}
+        else:
+            anchor = ChainAnchor.model_validate_json(args.anchor.read_text(encoding="utf-8"))
+            anchored = verify_anchored(
+                registry, anchor, load_public_key(args.public_key.read_bytes())
+            )
+            results = anchored.chains
+            status = {"anchored": True, "anchor_signature_valid": anchored.signature_valid}
     finally:
         registry.close()
-    print(
-        json.dumps(
-            {
-                name: {"ok": item.ok, "entries": item.entries, "head": item.head}
-                for name, item in results.items()
-            },
-            sort_keys=True,
+    if args.anchor is None:
+        print(
+            "no --anchor given: edited or reordered entries are detected, but a truncated tail "
+            "or a chain rebuilt by someone who can write the file is not (see anchor-chains)",
+            file=sys.stderr,
         )
-    )
-    return 0 if all(item.ok for item in results.values()) else 1
+    report: dict[str, object] = {
+        name: {
+            "ok": item.ok,
+            "entries": item.entries,
+            "head": item.head,
+            "first_bad_seq": item.first_bad_seq,
+        }
+        for name, item in results.items()
+    }
+    print(json.dumps({**report, **status}, sort_keys=True))
+    healthy = all(item.ok for item in results.values())
+    return 0 if healthy and status.get("anchor_signature_valid", True) else 1
+
+
+def _anchor_chains(args: argparse.Namespace) -> int:
+    from point_in_time_feature_store.anchors import create_anchor
+    from point_in_time_feature_store.registry import FeatureRegistry
+    from point_in_time_feature_store.serving.auth import load_private_key
+
+    key = load_private_key(args.signing_key.read_bytes())
+    registry = FeatureRegistry(args.registry)
+    try:
+        anchor = create_anchor(registry, key)
+    except ValueError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        registry.close()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(anchor.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    heads = {name: head.model_dump() for name, head in anchor.chains.items()}
+    print(json.dumps(heads, sort_keys=True))
+    return 0
 
 
 def _generate_keys(args: argparse.Namespace) -> int:
@@ -327,8 +370,20 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 - one subparser
     receipt.add_argument("receipt", type=Path)
     receipt.add_argument("--public-key", type=Path, required=True)
 
-    chains = sub.add_parser("verify-chains", help="verify the registry's hash chains")
+    chains = sub.add_parser(
+        "verify-chains", help="verify the registry's hash chains, optionally against an anchor"
+    )
     chains.add_argument("--registry", type=Path, default=Path("var/registry.sqlite"))
+    chains.add_argument("--anchor", type=Path, default=None, help="signed anchor JSON")
+    chains.add_argument("--public-key", type=Path, default=None, help="anchor public key (PEM)")
+
+    anchor_cmd = sub.add_parser(
+        "anchor-chains",
+        help="sign the current chain heads; keep the anchor away from the registry host",
+    )
+    anchor_cmd.add_argument("--registry", type=Path, default=Path("var/registry.sqlite"))
+    anchor_cmd.add_argument("--signing-key", type=Path, required=True)
+    anchor_cmd.add_argument("--out", type=Path, required=True)
 
     keys = sub.add_parser("generate-keys", help="generate JWT and receipt Ed25519 key pairs")
     keys.add_argument("--out-dir", type=Path, required=True)
@@ -371,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 - one subparser
         "materialize": _materialize,
         "verify-receipt": _verify_receipt,
         "verify-chains": _verify_chains,
+        "anchor-chains": _anchor_chains,
         "generate-keys": _generate_keys,
         "mint-token": _mint_token,
         "redis-acl": _redis_acl,

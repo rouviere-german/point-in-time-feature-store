@@ -175,6 +175,54 @@ def _materialize(args: argparse.Namespace) -> int:
         services.close()
 
 
+def _bootstrap(args: argparse.Namespace) -> int:
+    """Make a fresh deployment servable: definitions, synthetic data if empty, materialization."""
+    from point_in_time_feature_store.core.config import get_settings
+    from point_in_time_feature_store.offline.synthetic import (
+        SyntheticConfig,
+        churn_feature_repo,
+        generate_dataset,
+    )
+    from point_in_time_feature_store.registry import ApprovalRequiredError, PlanMismatchError
+    from point_in_time_feature_store.services import build_services
+
+    services = build_services(get_settings())
+    try:
+        try:
+            plan = services.registry.apply(churn_feature_repo(), actor=args.actor)
+        except (ApprovalRequiredError, PlanMismatchError) as exc:
+            print(
+                f"refused: {exc}; review with pitfs plan and apply with approval", file=sys.stderr
+            )
+            return 2
+        repo = services.registry.active_repo()
+        populated = any(services.store.files(source.name) for source in repo.sources)
+        rows_written: dict[str, int] = {}
+        if not populated:
+            dataset = generate_dataset(SyntheticConfig(n_customers=args.customers, seed=args.seed))
+            rows_written = {
+                name: services.ingest(name, frame).rows_written
+                for name, frame in dataset.sources.items()
+            }
+        materialized: dict[str, dict[str, int]] = {}
+        for view in repo.feature_views:
+            report = services.materializer.materialize(view.name)
+            materialized[view.name] = {
+                "watermark_us": report.watermark_us,
+                "written": report.written,
+            }
+        summary = {
+            "applied_changes": len(plan.changes),
+            "generated": not populated,
+            "rows_written": rows_written,
+            "materialized": materialized,
+        }
+        print(json.dumps(summary, sort_keys=True))
+        return 0
+    finally:
+        services.close()
+
+
 def _verify_receipt(args: argparse.Namespace) -> int:
     from point_in_time_feature_store.erasure import ErasureReceipt, verify_receipt
     from point_in_time_feature_store.serving.auth import load_public_key
@@ -362,6 +410,14 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 - one subparser
     generate.add_argument("--customers", type=int, default=14_000)
     generate.add_argument("--seed", type=int, default=0)
 
+    boot = sub.add_parser(
+        "bootstrap",
+        help="apply the bundled definitions, generate data into an empty store, materialize to now",
+    )
+    boot.add_argument("--customers", type=int, default=2_000)
+    boot.add_argument("--seed", type=int, default=0)
+    boot.add_argument("--actor", default="bootstrap")
+
     materialize = sub.add_parser("materialize", help="materialize views into Redis")
     materialize.add_argument("--view", default=None)
     materialize.add_argument("--up-to", default=None, help="ISO timestamp with timezone")
@@ -423,6 +479,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0915 - one subparser
         "export-definitions": _export_definitions,
         "catalog": _catalog,
         "generate-data": _generate_data,
+        "bootstrap": _bootstrap,
         "materialize": _materialize,
         "verify-receipt": _verify_receipt,
         "verify-chains": _verify_chains,

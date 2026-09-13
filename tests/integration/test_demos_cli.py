@@ -12,12 +12,13 @@ from typing import Any
 import fakeredis
 import pytest
 import redis
+from fastapi.testclient import TestClient
 from opentelemetry import trace as otel_trace
 
 from point_in_time_feature_store import cli
 from point_in_time_feature_store.catalog import render_catalog
 from point_in_time_feature_store.core import tracing
-from point_in_time_feature_store.core.config import get_settings
+from point_in_time_feature_store.core.config import Settings, get_settings
 from point_in_time_feature_store.core.security import hash_api_key
 from point_in_time_feature_store.definitions import FeatureRepo
 from point_in_time_feature_store.erasure import ErasureReceipt, ReceiptSigner
@@ -25,7 +26,10 @@ from point_in_time_feature_store.offline.synthetic import churn_feature_repo
 from point_in_time_feature_store.online.acl import validate_acl
 from point_in_time_feature_store.online.store import OnlineStore
 from point_in_time_feature_store.registry import FeatureRegistry
+from point_in_time_feature_store.services import build_services
+from point_in_time_feature_store.serving.api import create_feature_app
 from point_in_time_feature_store.serving.auth import (
+    Caller,
     TokenVerifier,
     load_private_key,
     load_public_key,
@@ -275,6 +279,54 @@ def test_data_and_materialize_commands_use_settings(
     assert set(reports) == {"customer_profile", "session_stats", "transaction_stats"}
     assert reports["transaction_stats"]["written"] > 0
     assert cli.main(["materialize", "--view", "session_stats"]) == 0
+
+
+@pytest.mark.usefixtures("fresh_settings", "restore_logging")
+def test_bootstrap_makes_a_fresh_deployment_servable_and_is_idempotent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = fakeredis.FakeServer()
+    OnlineStore(fakeredis.FakeRedis(server=server)).load_scripts()  # the redis-init step
+    monkeypatch.setattr(
+        redis.Redis, "from_url", lambda *args, **kwargs: fakeredis.FakeRedis(server=server)
+    )
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    command = ["bootstrap", "--customers", "40", "--seed", "3", "--actor", "compose"]
+    assert cli.main(command) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["generated"] is True
+    assert first["applied_changes"] > 0
+    assert first["rows_written"]["transactions"] > 0
+    assert first["materialized"]["customer_profile"]["written"] > 0
+
+    assert cli.main(command) == 0  # a container restart re-runs the one-shot service
+    second = json.loads(capsys.readouterr().out)
+    assert (second["generated"], second["applied_changes"], second["rows_written"]) == (
+        False,
+        0,
+        {},
+    )
+    assert all(item["written"] == 0 for item in second["materialized"].values())
+
+    services = build_services(
+        Settings(_env_file=None, data_dir=tmp_path),
+        redis_client=fakeredis.FakeRedis(server=server),
+    )
+    try:
+        with TestClient(create_feature_app(services), raise_server_exceptions=False) as client:
+            assert client.get("/readyz").status_code == 200
+        reader = Caller("svc-compose", frozenset({"features:read:customer_profile"}))
+        response = services.online_service.get(
+            reader, ["c000001"], ["customer_profile:plan_tier"], request_id="bootstrap-check"
+        )
+        (result,) = response.results
+        views = result["views"]
+        assert isinstance(views, dict)
+        profile = views["customer_profile"]
+        assert isinstance(profile, dict)
+        assert profile["status"] == "ok"
+    finally:
+        services.close()
 
 
 @pytest.mark.usefixtures("restore_logging", "fresh_settings")

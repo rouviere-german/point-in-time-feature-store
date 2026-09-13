@@ -271,3 +271,73 @@ jobs:
         with:
           name: sbom-cyclonedx
           path: sbom.cdx.json
+
+  compose:
+    name: compose (stack starts, /readyz and an authenticated online read succeed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, typecheck, test]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: throwaway secrets, keys and Redis ACL
+        run: |
+          app_password="$(openssl rand -hex 24)"
+          admin_password="$(openssl rand -hex 24)"
+          hmac_key="$(openssl rand -hex 32)"
+          echo "::add-mask::$app_password"
+          echo "::add-mask::$admin_password"
+          echo "::add-mask::$hmac_key"
+          {
+            echo "APP_REDIS_PASSWORD=$app_password"
+            echo "REDIS_ADMIN_PASSWORD=$admin_password"
+            echo "APP_LOG_HMAC_KEY=$hmac_key"
+          } >> "$GITHUB_ENV"
+          APP_REDIS_PASSWORD="$app_password" REDIS_ADMIN_PASSWORD="$admin_password" \
+            uv run pitfs redis-acl --out var/redis/users.acl
+          uv run pitfs generate-keys --out-dir var/keys
+          sudo chown 10001:10001 var/keys/receipt_private.pem
+      - name: docker compose up
+        run: docker compose up --detach --build
+      - name: wait for /readyz
+        run: |
+          for _ in $(seq 1 150); do
+            if curl --silent --fail http://127.0.0.1:8000/readyz; then
+              echo
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: authenticated online read returns a served value
+        run: |
+          token="$(uv run pitfs mint-token --private-key var/keys/jwt_private.pem \
+            --subject ci-compose --scope 'features:read:customer_profile')"
+          curl --silent --show-error --fail \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+            -d '{"entity_ids": ["c000001"], "features": ["customer_profile:plan_tier"]}' \
+            http://127.0.0.1:8000/v1/features/online > online.json
+          python3 - <<'EOF'
+          import json
+
+          with open("online.json", encoding="utf-8") as handle:
+              body = json.load(handle)
+          result = body["results"][0]
+          assert result["views"]["customer_profile"]["status"] == "ok", body
+          assert result["features"]["customer_profile:plan_tier"] is not None, body
+          print("online read ok")
+          EOF
+      - name: service logs
+        if: failure()
+        run: |
+          docker compose ps --all
+          docker compose logs --no-color
+      - name: docker compose down
+        if: always()
+        run: docker compose down --volumes

@@ -175,7 +175,8 @@ authenticated online read (job `compose`).
 Measured with `uv run python bench/bench_baseline.py --check` on 2026-09-13: Windows 10
 (10.0.19045), 6 logical CPUs, Python 3.12.14, DuckDB limited to 2 threads and 1 GB. The run printed
 "all benchmarks within thresholds"; CI runs the same command against `bench/thresholds.json`.
-Values are copied from that run's output. They are single-machine numbers for spotting
+Values are copied from that run's output, rerun after the fixes from an independent review
+(timings moved by run-to-run variance; the deterministic leakage AUCs and gaps did not change). They are single-machine numbers for spotting
 regressions, not performance claims.
 
 **As-of correctness** is established by tests rather than timing: both retrieval paths equal the
@@ -186,38 +187,50 @@ data, and the mutation test fails for event-time-only and naive joins (see [CLAI
 **Leakage demo** (`leakage_5_seeds`; 5 seeds, 10,000 customers each, mean holdout 7,064 rows;
 gap = offline AUC - holdout AUC; details in [MODEL_CARD.md](MODEL_CARD.md)):
 
-| Join used for training features | Offline AUC | Holdout AUC | Gap (mean of 5) | Gap range |
-|---|---:|---:|---:|---|
-| naive latest value | 1.0 | 0.4859 | **0.5141** | 0.4355 to 0.6595 |
-| ASOF on event time only | 0.8072 | 0.8089 | -0.0017 | -0.0026 to -0.0001 |
-| point-in-time (this store) | 0.8001 | 0.8080 | **-0.0079** | -0.0144 to -0.0058 |
+| Join used for training features | Offline AUC | Holdout AUC | Period control AUC | Gap (mean of 5) | Gap range | 95% CI (mean bounds) |
+|---|---:|---:|---:|---:|---|---|
+| naive latest value | 1.0 | 0.4859 | 0.474 | **0.5141** | 0.4355 to 0.6595 | 0.4865 to 0.5411 |
+| ASOF on event time only | 0.8072 | 0.8089 | 0.8025 | -0.0017 | -0.0026 to -0.0001 | -0.0311 to 0.0243 |
+| point-in-time (this store) | 0.8001 | 0.8080 | 0.8026 | **-0.0079** | -0.0144 to -0.0058 | -0.0379 to 0.0192 |
 
-The spec's targets (naive gap >= 0.05, point-in-time gap <= 0.01) hold. The event-time-only join
-leaks little on this data because most ingestion lag is hours while labels look 30 days ahead; the
-property tests, not this experiment, are what show it is wrong.
+The CI is a 95% percentile interval from a bootstrap that resamples customers (all of a
+customer's label rows together) in the validation and holdout sets, 200 resamples per seed. The
+period control scores the validation customers in the holdout period with point-in-time features,
+so it shares its customers with the offline AUC and its period with the holdout AUC.
+
+The spec's targets (naive gap >= 0.05, point-in-time gap <= 0.01) hold. The naive gap is large by
+construction: under a latest-value join `customer_profile:is_cancelled` encodes the label, so
+offline AUC is 1.0; its lowest per-seed CI bound is 0.4076. The point-in-time gap is negative for
+every seed, but every seed's interval contains 0 (`pit_gap_ci95_contains_zero_seeds: 5`), and the
+period control (0.8026) sits between offline (0.8001) and holdout (0.8080): about 0.0025 of the
+difference is between periods and 0.0054 between the validation and holdout customers, both within
+resampling noise. The event-time-only join leaks nothing measurable on this data because most
+ingestion lag is hours while labels look 30 days ahead; the property and mutation tests, not this
+experiment, are what show it is wrong.
 
 **Parity** (`parity_10k_requests`): 10,000 online requests over 3,000 customers, served across
 four incremental materializations with late data in between (1,000 of the logged reads taken
-while a materialization was in flight); 30,000 logged reads rechecked offline in 1.355 s:
+while a materialization was in flight); 30,000 logged reads rechecked offline in 1.37 s:
 **0 mismatches**.
 
 **Idempotency** (`materialization_idempotency`):
 
 | Run over 1,023,768 source rows, 3 views, into fakeredis | Time | Store digest |
 |---|---:|---|
-| 4 incremental runs (day 100, 200, 300, horizon) | 40.933 s | reference |
-| 1 one-shot run to the horizon | 17.407 s | identical to reference |
-| 4 runs again with a 500-day overlap over the same store | 42.522 s | identical to reference |
+| 4 incremental runs (day 100, 200, 300, horizon) | 40.603 s | reference |
+| 1 one-shot run to the horizon | 16.895 s | identical to reference |
+| 4 runs again with a 500-day overlap over the same store | 41.448 s | identical to reference |
+
 **Online latency** (`online_get_50_features`): one read of 50 features across 5 views through the
 service layer (permission planning, `MULTI/EXEC` snapshot read, decoding, freshness), 5,000 reads
-against **fakeredis in-process** (no network): p50 1.715 ms, p95 3.0 ms, **p99 3.495 ms**
+against **fakeredis in-process** (no network): p50 1.759 ms, p95 3.346 ms, **p99 4.135 ms**
 (target < 10 ms). The access-audit write and HTTP handling are not included. CI repeats the
 benchmark against a Redis service container.
 
 **Historical retrieval on 1M rows** (`retrieval_1m_rows`): 1,036,748 source rows (generated in
-1.039 s, validated and written in 1.369 s); every feature of the three views for a random
-200,000-row spine in **1.621 s** (123,381 spine rows/s). DuckDB planned the range join as
-`HASH_JOIN`. For `session_stats` the ASOF fast path took 0.242 s and the range join 0.104 s, with
+1.107 s, validated and written in 1.582 s); every feature of the three views for a random
+200,000-row spine in **1.892 s** (105,708 spine rows/s). DuckDB planned the range join as
+`HASH_JOIN`. For `session_stats` the ASOF fast path took 0.323 s and the range join 0.111 s, with
 identical results. The first benchmark run measured 38.75 s for the ASOF path because DuckDB had
 planned a nested loop; the engine now forces the `ASOF_JOIN` plan (see ADR 0003).
 

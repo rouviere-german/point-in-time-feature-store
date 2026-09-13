@@ -53,24 +53,34 @@ the quantity of interest. Numbers are copied from `bench/bench_baseline.py` outp
   features, which is what serving would have returned at those times.
 - **Arms:** `naive_latest` attaches each customer's latest row from an extract taken on day 275;
   `event_time_asof` joins on event time only; `pit` uses the store's retrieval.
+- **Period control AUC:** validation customers' labels between day 280 and day 380, scored with
+  point-in-time features. It shares its customers with the offline AUC and its period with the
+  holdout AUC, which separates a period difference from a customer-split difference.
+- **Gap confidence interval:** 95% percentile interval from 200 bootstrap resamples of customers
+  (all of a customer's label rows together, since they are correlated), drawn independently for
+  the validation and holdout sets; all arms of a seed use the same resamples.
 - **Results:**
 
   From `uv run python bench/bench_baseline.py --check` (benchmark `leakage_5_seeds`), 5 seeds
   (generator seeds 100 to 104, model seeds 0 to 4), 10,000 generated customers per seed, mean
   holdout size 7,064 label rows. Gap = offline AUC - holdout AUC. Run on 2026-09-13, Windows 10,
-  6 logical CPUs, Python 3.12.14; two consecutive runs printed identical values.
+  6 logical CPUs, Python 3.12.14. The AUCs and gaps are identical to the run before the interval
+  and period control were added.
 
-  | Arm | Offline AUC (mean) | Holdout AUC (mean) | Gap (mean) | Gap per seed |
-  |---|---:|---:|---:|---|
-  | `naive_latest` | 1.0 | 0.4859 | 0.5141 | 0.6595, 0.4355, 0.4914, 0.4895, 0.4946 |
-  | `event_time_asof` | 0.8072 | 0.8089 | -0.0017 | -0.0001, -0.0024, -0.0010, -0.0026, -0.0024 |
-  | `pit` | 0.8001 | 0.8080 | -0.0079 | -0.0058, -0.0144, -0.0059, -0.0069, -0.0064 |
+  | Arm | Offline AUC (mean) | Holdout AUC (mean) | Period control AUC (mean) | Gap (mean) | Gap per seed | 95% CI per seed |
+  |---|---:|---:|---:|---:|---|---|
+  | `naive_latest` | 1.0 | 0.4859 | 0.474 | 0.5141 | 0.6595, 0.4355, 0.4914, 0.4895, 0.4946 | [0.6359, 0.6873], [0.4076, 0.4615], [0.4616, 0.5188], [0.4569, 0.5202], [0.4705, 0.5176] |
+  | `event_time_asof` | 0.8072 | 0.8089 | 0.8025 | -0.0017 | -0.0001, -0.0024, -0.0010, -0.0026, -0.0024 | [-0.0299, 0.0277], [-0.0349, 0.0207], [-0.0287, 0.0269], [-0.0271, 0.0231], [-0.0346, 0.0231] |
+  | `pit` | 0.8001 | 0.8080 | 0.8026 | -0.0079 | -0.0058, -0.0144, -0.0059, -0.0069, -0.0064 | [-0.0347, 0.0228], [-0.0478, 0.0085], [-0.0348, 0.0252], [-0.0336, 0.0204], [-0.0388, 0.0191] |
 
-  The naive model reaches a perfect offline AUC because the cancellation row is in the extract,
-  and scores worse than chance on the holdout, where no active customer is cancelled yet. The
-  point-in-time gap is negative for every seed: the holdout period scores slightly better than
-  the validation period. The retrieval is oracle-checked, so this is not leakage; it is most
-  likely a small difference between the generated periods, which was not investigated further.
+  The naive model reaches a perfect offline AUC because the cancellation row is in the extract
+  (`customer_profile:is_cancelled` encodes the label under a latest-value join), and scores worse
+  than chance on the holdout, where no active customer is cancelled yet; its interval is far from
+  0 for every seed. The point-in-time gap is negative for every seed, but every seed's interval
+  contains 0. The period control (0.8026) lies between the offline (0.8001) and holdout (0.8080)
+  AUCs: roughly 0.0025 of the difference is between the periods and 0.0054 between the validation
+  and holdout customers, both well inside the resampling noise. The retrieval is oracle-checked,
+  so this is not leakage.
 - **Slices:** not evaluated (synthetic data, no protected attributes).
 
 ## Robustness, drift and monitoring

@@ -9,6 +9,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from point_in_time_feature_store.core.config import Settings
 from point_in_time_feature_store.serving.auth import (
     Caller,
     TokenVerifier,
@@ -71,6 +72,28 @@ def test_valid_tokens_yield_scoped_callers() -> None:
 )
 def test_invalid_tokens_are_rejected(bad: str | None) -> None:
     assert VERIFIER.verify(bad) is None
+
+
+def test_tokens_with_excessive_lifetimes_or_future_issue_times_are_rejected() -> None:
+    century = token(scopes=["features:read:*", "pii:read"], ttl_seconds=100 * 365 * 86_400)
+    assert VERIFIER.verify(century) is None
+    assert VERIFIER.verify(token(ttl_seconds=3_601)) is None
+    assert VERIFIER.verify(token(ttl_seconds=3_600)) is not None
+    assert VERIFIER.verify(token(now=time.time() + 600)) is None
+    strict = TokenVerifier(
+        load_public_key(PUBLIC_PEM),
+        issuer=ISSUER,
+        audience=AUDIENCE,
+        leeway_seconds=0,
+        max_lifetime_seconds=300,
+    )
+    assert strict.verify(token(ttl_seconds=300)) is not None
+    assert strict.verify(token(ttl_seconds=900)) is None
+    with pytest.raises(ValueError, match="max_lifetime_seconds"):
+        TokenVerifier(
+            load_public_key(PUBLIC_PEM), issuer=ISSUER, audience=AUDIENCE, max_lifetime_seconds=0
+        )
+    assert Settings(_env_file=None).jwt_max_token_lifetime_seconds == 3_600
 
 
 def _segments(value: dict[str, object]) -> str:

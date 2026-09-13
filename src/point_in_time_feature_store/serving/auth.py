@@ -2,7 +2,10 @@
 
 The service holds only the issuer's public key, so a compromised service cannot mint tokens.
 Tokens must carry ``iss``, ``aud``, ``sub``, ``iat`` and ``exp``; the algorithm is pinned to
-``EdDSA`` (``alg: none`` and HMAC confusion are refused by construction).
+``EdDSA`` (``alg: none`` and HMAC confusion are refused by construction). There is no revocation
+list, so the lifetime is bounded instead: ``exp - iat`` must be positive and at most
+``max_lifetime_seconds`` (default one hour), and an ``iat`` in the future beyond the leeway is
+refused.
 
 Scopes (space-separated ``scope`` claim):
 
@@ -121,11 +124,15 @@ class TokenVerifier:
         issuer: str,
         audience: str,
         leeway_seconds: int = 30,
+        max_lifetime_seconds: int = 3_600,
     ) -> None:
+        if max_lifetime_seconds <= 0:
+            raise ValueError("max_lifetime_seconds must be positive")
         self._key = public_key
         self._issuer = issuer
         self._audience = audience
         self._leeway = leeway_seconds
+        self._max_lifetime = max_lifetime_seconds
 
     def verify(self, token: str | None) -> Caller | None:
         """Return the caller for a valid token, else None (no reason is exposed)."""
@@ -142,6 +149,15 @@ class TokenVerifier:
                 options={"require": ["exp", "iat", "iss", "aud", "sub"]},
             )
         except jwt.PyJWTError:
+            return None
+        issued, expires = claims.get("iat"), claims.get("exp")
+        if (
+            not isinstance(issued, int)
+            or not isinstance(expires, int)
+            or isinstance(issued, bool)
+            or isinstance(expires, bool)
+            or not 0 < expires - issued <= self._max_lifetime
+        ):
             return None
         subject = claims.get("sub")
         scope = claims.get("scope", "")

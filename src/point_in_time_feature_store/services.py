@@ -124,6 +124,7 @@ def _verifier(settings: Settings) -> TokenVerifier | None:
         load_public_key(settings.jwt_public_key_path.read_bytes()),
         issuer=settings.jwt_issuer,
         audience=settings.jwt_audience,
+        max_lifetime_seconds=settings.jwt_max_token_lifetime_seconds,
     )
 
 

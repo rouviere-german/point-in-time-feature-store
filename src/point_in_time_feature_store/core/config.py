@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     jwt_public_key_path: Path | None = None
     jwt_issuer: str = Field(default="pitfs-dev-issuer", min_length=1, max_length=256)
     jwt_audience: str = Field(default="point-in-time-feature-store", min_length=1, max_length=256)
+    # Upper bound on exp - iat: tokens cannot be revoked, so long-lived ones are refused.
+    jwt_max_token_lifetime_seconds: int = Field(default=3_600, ge=60, le=86_400)
 
     # --- observability ---
     tracing_exporter: Literal["none", "console"] = "none"

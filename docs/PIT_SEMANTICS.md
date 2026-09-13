@@ -111,9 +111,16 @@ materialization, and nothing else. While a run is in flight, the reader snapshot
 carries both the committed and the in-flight watermark, and each entity is at one of the two;
 the skew checker accepts either and nothing in between.
 
-Once a view is materialized up to `W`, the offline store refuses rows with `ingested_at <= W` for
-its source (`knowledge_time_append_only`), because such rows would be visible offline but never
-reach the online store.
+Once a view is materialized up to `W`, or while a run up to `W` is in flight, the offline store
+refuses rows with `ingested_at <= W` for its source (`knowledge_time_append_only`), because such
+rows would be visible offline but never reach the online store. The in-flight case matters because
+a run scans the store before it commits `W`. A run therefore records its target in the registry
+while holding the offline store lock, before scanning, and appends read this knowledge floor (the
+highest committed watermark or in-flight target of the source's views) under the same lock. An
+append either completed before the scan, which then includes it, or is refused. A run that fails
+before committing releases its target. At most one materializer per view runs at a time
+(`test_appends_during_an_inflight_materialization_are_refused_not_lost`,
+`test_a_failed_materialization_releases_its_knowledge_floor`).
 
 ## Erasure
 

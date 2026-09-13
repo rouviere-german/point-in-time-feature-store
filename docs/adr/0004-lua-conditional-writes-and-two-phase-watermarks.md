@@ -36,6 +36,14 @@ Options considered for writes:
   both, and the skew checker accepts either answer.
 - The registry watermark is written after the Redis commit, so a crash between the two causes a
   harmless re-run rather than a gap.
+- Concurrent appends: a run records its target (`inflight_watermarks`) in the registry while
+  holding the offline store lock, before scanning. Appends read the knowledge floor, the highest
+  committed watermark or in-flight target of the source's views, under the same lock and refuse
+  rows at or below it. Without this (the first version checked committed watermarks only), a row
+  appended between a run's scan and its watermark commit, with `ingested_at` between the old
+  watermark and the target, passed the append-only check, was never scanned, and every later
+  window started above it. A run that fails before committing releases its target, because the
+  next run rescans from the committed watermark.
 
 ## Consequences
 
@@ -49,3 +57,9 @@ Options considered for writes:
 - Expired rows are hidden at read time (TTL checked against request time) rather than removed by
   Redis expiry, because synthetic timelines are not wall-clock time. A production deployment
   would add a compaction job.
+- Appends wait only while a run records its target, not for the whole run. An append refused
+  because a run is in flight can be retried with a later `ingested_at`. A process that crashes
+  mid-run leaves its target behind, which keeps refusing rows below it (fail closed) until the
+  view is materialized to that target or beyond.
+- One materializer per view at a time is assumed and not enforced; runs of different views may
+  overlap.

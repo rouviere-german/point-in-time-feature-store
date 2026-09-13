@@ -49,7 +49,7 @@ flowchart LR
     end
     subgraph erasure["Erasure"]
         delete["DELETE /v1/entities/{id}"] --> tomb["Tombstone"] --> rewrite["Rewrite partitions"]
-        rewrite --> dropkeys["Delete keys of every view version"] --> droplog["Delete request-log rows"]
+        rewrite --> dropkeys["Delete keys of every view version"] --> droplog["Delete request-log rows<br/>scrub the SQLite file"]
         droplog --> receipt["Ed25519 receipt<br/>before/after file hashes"]
     end
     registry --> join
@@ -81,12 +81,17 @@ in `(previous watermark, new watermark]`, keeps the greatest row per entity and 
 a registered Lua script that only replaces a stored row with a greater key. Reruns, overlaps and
 out-of-order batches therefore converge to the same state. Reads use `MULTI/EXEC` and log the
 committed and in-flight watermarks with the served values; the skew checker recomputes each
-logged read offline as of that watermark and must match exactly.
+logged read offline as of that watermark and must match exactly. A run records its target under
+the offline store lock before it scans, and appends check their `ingested_at` against committed
+and in-flight targets under the same lock, so a row cannot land between a scan and its watermark
+commit and be skipped for good.
 
 **Erasure.** Sources are partitioned by a hash of the entity id, so erasure rewrites one bucket per
-source. Keys of every view version ever applied are deleted, as are request-log rows. Tombstones
-keep the entity out of later appends, materializations and request logging, and the receipt is
-signed with Ed25519.
+source. Keys of every view version ever applied are deleted, as are request-log rows, and the
+request-log SQLite file is scrubbed (`secure_delete`, WAL checkpoint, `VACUUM`) so the id is gone
+from the bytes on disk, not only from the table. Tombstones are read under the store lock and keep
+the entity out of later and racing appends, materializations and request logging. The receipt is
+signed with Ed25519, and purge verification scans the raw SQLite bytes as well as every store.
 
 Layout:
 
@@ -128,25 +133,42 @@ uv run pitfs export-definitions --out var/definitions.json
 uv run pitfs plan  --definitions var/definitions.json --registry var/registry.sqlite
 uv run pitfs apply --definitions var/definitions.json --registry var/registry.sqlite --actor you
 uv run pitfs catalog --out FEATURE_CATALOG.md
-uv run pitfs verify-chains --registry var/registry.sqlite
+uv run pitfs generate-keys --out-dir var/keys
+uv run pitfs anchor-chains --registry var/registry.sqlite \
+    --signing-key var/keys/receipt_private.pem --out anchors/registry-anchor.json
+uv run pitfs verify-chains --registry var/registry.sqlite \
+    --anchor anchors/registry-anchor.json --public-key var/keys/receipt_public.pem
 ```
 
-Run the service against Redis (see `docker-compose.yml` for the full stack):
+Keep anchors away from the registry host and take them regularly. Without `--anchor`,
+`verify-chains` detects edited or reordered entries but not a truncated tail or a chain rebuilt by
+someone who can write the SQLite file, and says so.
+
+Run the full stack with Docker Compose (see `docker-compose.yml`):
 
 ```bash
 uv run pitfs generate-keys --out-dir var/keys
+sudo chown 10001:10001 var/keys/receipt_private.pem   # the app container user; mode stays 0600
 export APP_REDIS_PASSWORD=... REDIS_ADMIN_PASSWORD=... APP_LOG_HMAC_KEY=...
 uv run pitfs redis-acl --out var/redis/users.acl      # passwords appear only as SHA-256
-docker compose up --build                              # Redis with ACL, script loader, API
-uv run pitfs mint-token --private-key var/keys/jwt_private.pem --subject svc-scoring \
-    --scope 'features:read:*'
-curl -s -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-     -d '{"entity_ids": ["c000001"], "features": ["transaction_stats:*"]}' \
+docker compose up --build    # Redis (ACL), script loader, bootstrap, API
+TOKEN="$(uv run pitfs mint-token --private-key var/keys/jwt_private.pem --subject svc-scoring \
+    --scope 'features:read:customer_profile')"
+curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"entity_ids": ["c000001"], "features": ["customer_profile:plan_tier"]}' \
      http://127.0.0.1:8000/v1/features/online
 ```
 
-Containers were not run while building this repository; the build, smoke test, trivy scan and
-SBOM are verified in CI (`.github/workflows/ci.yml`, job `docker`).
+The one-shot `bootstrap` service (`pitfs bootstrap`) applies the bundled definitions, generates
+synthetic sources into the empty data volume and materializes every view up to now, so `/readyz`
+becomes healthy and the API has data to serve; re-running it is a no-op apart from materializing
+newly visible rows. The synthetic timeline ends in February 2026, so views with a TTL
+(`transaction_stats`, `session_stats`) hold no unexpired values at wall-clock time; the example
+reads `customer_profile`, which has no TTL.
+
+Containers were not run while building this repository. CI builds, smoke-tests, scans and SBOMs
+the image (job `docker`) and brings this compose stack up, waits for `/readyz` and checks an
+authenticated online read (job `compose`).
 
 ## Results
 
@@ -205,7 +227,8 @@ Threats, controls and tests are in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md);
 links to evidence in [CLAIMS.md](CLAIMS.md).
 
 - **Authentication and scopes.** Callers present EdDSA JWTs verified with the issuer's public key
-  (algorithm pinned; `exp`, `iat`, `iss`, `aud`, `sub` required). Reading a view needs
+  (algorithm pinned; `exp`, `iat`, `iss`, `aud`, `sub` required; `exp - iat` at most one hour by
+  default, because tokens cannot be revoked). Reading a view needs
   `features:read:<view>`; PII-tagged features need `pii:read` and are otherwise omitted and listed;
   erasure needs `entities:erase`. `/metrics` uses a separate API key.
 - **No user SQL.** Transformations are a bounded, closed expression tree; SQL identifiers pass a
@@ -219,24 +242,38 @@ links to evidence in [CLAIMS.md](CLAIMS.md).
 - **Input limits.** Entity keys are validated against fixed presets, batch and feature counts are
   capped, bodies are size-limited, and rate limits apply per verified JWT subject.
 - **Privacy.** Entity ids appear in logs only as HMAC-SHA256; PII values are stored in the request
-  log only as keyed HMACs; erasure receipts carry the HMAC, never the id. Purge verification checks
-  Parquet, Redis, the request log and captured logs.
-- **Integrity and audit.** Registry changes and every online read are appended to hash-chained
-  tables; erasure receipts are Ed25519-signed; contract failures block materialization.
+  log only as keyed HMACs; erasure receipts carry the HMAC, never the id. Erasure scrubs the
+  request-log SQLite file, and purge verification checks Parquet, Redis, the request log, the raw
+  bytes of the SQLite files and their WAL, and captured logs.
+- **Integrity and audit.** Registry changes and every authenticated online read attempt, granted or
+  refused, are appended to hash-chained tables, as are refused erasures. The chains detect
+  in-place edits; truncation and rebuilt chains are detected against Ed25519-signed anchors kept
+  outside the database (`pitfs anchor-chains`, `pitfs verify-chains --anchor`). Erasure receipts
+  are Ed25519-signed; contract failures block materialization.
 - **Supply chain and runtime.** uv.lock with hashes, pip-audit, bandit, semgrep, gitleaks,
   hadolint, trivy and a CycloneDX SBOM in CI; digest-pinned base images; non-root, read-only
-  containers with all capabilities dropped. See [SECURITY.md](SECURITY.md) for reporting.
+  containers with all capabilities dropped (the compose Redis also starts as its non-root user and
+  keeps no persistence files). See [SECURITY.md](SECURITY.md) for reporting.
 
 ## Non-goals
 
 - **Scale.** Single-node DuckDB and one Redis; no distributed query engine, sharding or
   multi-region replication. Correctness first.
-- **Windowed aggregations and streaming.** Transformations are row-level by design (they cannot
-  look at other rows). Rolling counts arrive precomputed from upstream, as in the synthetic data;
-  there is no streaming ingestion or on-demand transformation at request time.
-- **IEJoin.** The spec asked for a DuckDB IEJoin range join. With an equality on `entity_id` plus
-  range predicates, DuckDB plans a `HASH_JOIN` with the inequalities as join conditions; the
-  benchmark reports the operator it actually used.
+- **Windowed aggregations, request-time transformations and streaming.** Transformations are
+  row-level by design (they cannot look at other rows). Point-in-time-correct windowed
+  aggregations (a rolling count as of label time and as of the materialization watermark), the
+  hardest part of a production feature store, are not implemented: rolling counts arrive
+  precomputed from upstream, as in the synthetic data. There is no on-demand transformation
+  executed separately at request time and no streaming ingestion.
+- **Skew between two transformation implementations.** The skew checker recomputes logged reads
+  with the same transformation code that materialization used. It catches watermark, write-path,
+  serving and direct-edit skew, but with a single implementation it cannot exercise the classic
+  case of offline and online code diverging.
+- **IEJoin, and a faster ASOF path.** The spec asked for a DuckDB IEJoin range join. With an
+  equality on `entity_id` plus range predicates, DuckDB plans a `HASH_JOIN` with the inequalities
+  as join conditions; the benchmark reports the operator it actually used. The ASOF fast path is
+  kept because it is oracle-checked, but on this data it is slower than the range join (see
+  Results); a spine size or entity-cardinality regime where it pays off was not benchmarked.
 - **MLflow tracking server.** Lineage uses MLflow's file store, which MLflow 3 keeps in maintenance
   mode behind `MLFLOW_ALLOW_FILE_STORE=true` (set by the training code); lineage is duplicated in
   the registry's `training_runs` table.
@@ -245,7 +282,7 @@ links to evidence in [CLAIMS.md](CLAIMS.md).
   datasets exported by users are out of scope. Erasure rewrites history on purpose, so a training
   set that contained the entity cannot be rebuilt bit-for-bit.
 - **Token lifecycle.** No token revocation or key rotation workflow; the service trusts one issuer
-  public key.
+  public key. Token lifetime is capped instead (one hour by default).
 - **Redis key expiry.** TTLs are enforced when reading (against request time), not by Redis
   expiry, so expired rows stay in memory until overwritten or erased.
 - **ACL enforcement in local tests.** fakeredis does not enforce ACLs; the ACL is validated
@@ -255,7 +292,23 @@ links to evidence in [CLAIMS.md](CLAIMS.md).
   there is no scheduler or alerting.
 - **Metric naming.** The spec's `materialization_lag` is exported as
   `materialization_lag_seconds` (Prometheus unit suffix).
-- **Local containers.** `docker compose` was not run while building this repository.
+- **Local containers.** Neither the image nor `docker compose` was run while building this
+  repository; both are exercised only in CI (jobs `docker` and `compose`).
+- **Concurrent materializers of one view.** Appends and materialization runs are serialized through
+  the offline store lock and in-flight targets, but at most one materializer per view is assumed
+  and not enforced.
+- **Erasure below the storage engines.** Erasure scrubs the request-log SQLite file and rewrites
+  Parquet parts. It does not overwrite filesystem blocks (journaling, SSD remapping, snapshots),
+  Redis replicas or persistence files, or backups.
+- **Audit of unauthenticated requests.** Requests without a valid token have no verified subject
+  and are counted in `auth_failures_total` only, not in the hash-chained access audit.
+- **A leak the event-time-only join visibly exploits.** The synthetic data has hours of ingestion
+  lag against a 30-day label horizon, so the event-time-only arm shows no measurable AUC leak; its
+  wrongness is shown by the property and mutation tests. A regime with label-correlated,
+  horizon-scale ingestion lag was not added.
+- **Online latency over a network.** Locally the latency benchmark runs in-process on fakeredis;
+  no TCP round-trip number against a real Redis was measured here (CI runs it against a Redis
+  service container, but that output is not copied into this README).
 
 ## Documentation
 

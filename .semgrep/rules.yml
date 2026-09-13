@@ -1,0 +1,122 @@
+# Repository-specific semgrep rules, run in CI next to the p/python and p/secrets registry packs.
+rules:
+  - id: no-pickle-family-serialization
+    languages: [python]
+    severity: ERROR
+    message: >-
+      pickle-compatible formats execute code on load. Use JSON, Parquet, npz with
+      allow_pickle=False or LightGBM's text model format instead.
+    pattern-either:
+      - pattern: import pickle
+      - pattern: import cPickle
+      - pattern: import dill
+      - pattern: import joblib
+      - pattern: import cloudpickle
+      - pattern: import shelve
+      - pattern: import _pickle
+      - pattern: from pickle import $X
+      - pattern: from _pickle import $X
+      - pattern: from cPickle import $X
+      - pattern: from dill import $X
+      - pattern: from joblib import $X
+      - pattern: from cloudpickle import $X
+      - pattern: from shelve import $X
+
+  - id: pandas-pickle-io
+    languages: [python]
+    severity: ERROR
+    message: pandas read_pickle/to_pickle use pickle; use Parquet, CSV or JSON instead.
+    pattern-either:
+      - pattern: pandas.read_pickle(...)
+      - pattern: $FRAME.to_pickle(...)
+
+  - id: numpy-load-allow-pickle
+    languages: [python]
+    severity: ERROR
+    message: numpy.load must keep allow_pickle=False.
+    pattern: numpy.load(..., allow_pickle=True, ...)
+
+  - id: sql-built-with-string-formatting
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Never build SQL with f-strings, % or .format. Bind values as parameters; identifiers go
+      through point_in_time_feature_store.sqlbuild.quote_ident.
+    pattern-either:
+      - pattern: $DB.execute(f"...", ...)
+      - pattern: $DB.execute(f"...")
+      - pattern: $DB.executemany(f"...", ...)
+      - pattern: $DB.execute("..." % $ARGS, ...)
+      - pattern: $DB.execute("..." % $ARGS)
+      - pattern: $DB.execute("...".format(...), ...)
+      - pattern: $DB.execute("...".format(...))
+
+  - id: redis-eval-of-inline-scripts
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Only registered scripts may run, via EVALSHA (online/store.py SCRIPTS). EVAL of inline Lua
+      is refused by the application's Redis ACL.
+    pattern-either:
+      - pattern: $R.eval(...)
+      - pattern: $R.eval_ro(...)
+      - pattern: $R.register_script(...)
+
+  - id: jwt-decode-without-pinned-algorithms
+    languages: [python]
+    severity: ERROR
+    message: jwt.decode must pin algorithms=[...] (alg confusion and alg=none).
+    patterns:
+      - pattern: jwt.decode(...)
+      - pattern-not: jwt.decode(..., algorithms=[...], ...)
+
+  - id: jwt-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: JWT signature verification must stay enabled.
+    pattern: 'jwt.decode(..., options={..., "verify_signature": False, ...}, ...)'
+
+  - id: yaml-unsafe-load
+    languages: [python]
+    severity: ERROR
+    message: Use yaml.safe_load (yaml.load can construct arbitrary objects).
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load(..., Loader=yaml.CSafeLoader, ...)
+
+  - id: no-eval-or-exec
+    languages: [python]
+    severity: ERROR
+    message: eval/exec on dynamic input is code injection.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: shell=True enables command injection; pass an argument list.
+    pattern: subprocess.$FUNC(..., shell=True, ...)
+
+  - id: tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: TLS certificate verification must stay enabled.
+    pattern: $CLIENT(..., verify=False, ...)
+
+  - id: hmac-digest-compared-with-equality
+    languages: [python]
+    severity: ERROR
+    message: Compare MACs with hmac.compare_digest to avoid timing leaks.
+    pattern-either:
+      - pattern: hmac.new(...).hexdigest() == $X
+      - pattern: $X == hmac.new(...).hexdigest()
+      - pattern: hmac.new(...).digest() == $X
+      - pattern: $X == hmac.new(...).digest()
+
+  - id: cors-wildcard-origin
+    languages: [python]
+    severity: ERROR
+    message: CORS must list explicit origins.
+    pattern: $APP.add_middleware(CORSMiddleware, ..., allow_origins=["*"], ...)

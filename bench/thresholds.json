@@ -1,0 +1,22 @@
+{
+  "retrieval_1m_rows": {
+    "retrieval_s": {"max": 10.0},
+    "session_asof_s": {"max": 2.0},
+    "asof_equals_range_join": {"min": 1}
+  },
+  "online_get_50_features": {
+    "p99_ms": {"max": 10.0}
+  },
+  "parity_10k_requests": {
+    "requests": {"min": 10000},
+    "mismatches": {"max": 0}
+  },
+  "leakage_5_seeds": {
+    "naive_latest_gap_mean": {"min": 0.05},
+    "pit_gap_mean": {"max": 0.01}
+  },
+  "materialization_idempotency": {
+    "incremental_equals_one_shot": {"min": 1},
+    "rerun_identical": {"min": 1}
+  }
+}

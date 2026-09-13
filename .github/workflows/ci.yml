@@ -1,0 +1,273 @@
+# CI for the point-in-time feature store. CI runs online; the local test suite, demo and bench run
+# offline (fakeredis, synthetic data, no API keys).
+#
+# Action pinning: actions are pinned to release tags and kept current by Dependabot
+# (.github/dependabot.yml, github-actions ecosystem). Before the repo is published, replace each tag
+# with the full commit SHA it points to and keep the tag as a trailing comment (for example with
+# `pinact run`): a tag can be moved, a SHA cannot. Verify the trivy-action tag in particular.
+# Container base images are pinned by digest in the Dockerfile; the Redis service image is
+# tag-pinned and must be digest-pinned at publish time too.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+  PYTHONHASHSEED: "0"
+  HYPOTHESIS_PROFILE: ci
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  typecheck:
+    name: typecheck (mypy --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run mypy
+
+  test:
+    name: test (pytest, coverage floor 85%, Redis service)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # Enables tests marked `redis` (ACL enforcement against a real server).
+      APP_TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  bench:
+    name: bench (evaluation metrics, regression thresholds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # The online latency benchmark runs against the real Redis service here.
+      APP_BENCH_REDIS_URL: redis://localhost:6379/1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run python bench/bench_baseline.py --check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench/results/latest.json
+          if-no-files-found: ignore
+
+  demo:
+    name: demo (offline end to end)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run python tasks.py demo
+
+  baseline:
+    name: baseline (scripts/check_baseline.py)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: uv run --no-project python scripts/check_baseline.py
+
+  bandit:
+    name: bandit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run bandit -c pyproject.toml -r src
+
+  semgrep:
+    name: semgrep (registry + repo rules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: semgrep scan
+        run: >-
+          uvx --from "semgrep>=1.100,<2" semgrep scan
+          --config p/python
+          --config p/secrets
+          --config .semgrep/rules.yml
+          --error --metrics off
+
+  pip-audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      # tasks.py exports the locked requirements (with hashes) and applies the reviewed ignore
+      # list from [tool.portfolio.audit] in pyproject.toml.
+      - run: uv run --no-project python tasks.py pip-audit
+
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: docker (hadolint, build, smoke test, trivy, syft SBOM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, typecheck, test]
+    env:
+      IMAGE: point-in-time-feature-store:ci
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+      - uses: docker/setup-buildx-action@v3
+      - name: docker build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}
+      - name: container smoke test (HEALTHCHECK reports healthy)
+        run: |
+          docker run --detach --name app --read-only --tmpfs /tmp \
+            --tmpfs /data:rw,uid=10001,gid=10001,size=64m --cap-drop ALL \
+            --security-opt no-new-privileges --health-interval 3s \
+            --env APP_ENVIRONMENT=dev "$IMAGE"
+          for _ in $(seq 1 30); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' app)"
+            if [ "$status" = "healthy" ]; then
+              test "$(docker inspect --format '{{.Config.User}}' app)" = "10001:10001"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs app
+          exit 1
+      - name: trivy image scan
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+      - name: syft CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json

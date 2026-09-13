@@ -1,0 +1,86 @@
+# Local stack: Redis 7 with an ACL, a one-shot script loader, and the feature store API.
+#
+# Before `docker compose up --build`:
+#   export APP_REDIS_PASSWORD=... REDIS_ADMIN_PASSWORD=...  (16+ characters each)
+#   export APP_LOG_HMAC_KEY=...                             (32+ characters)
+#   uv run pitfs redis-acl --out var/redis/users.acl        (only SHA-256 digests are written)
+#   uv run pitfs generate-keys --out-dir var/keys
+# The Redis image is tag-pinned; pin its digest before deploying anywhere shared.
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--aclfile", "/usr/local/etc/redis/users.acl", "--appendonly", "no"]
+    volumes:
+      - ./var/redis/users.acl:/usr/local/etc/redis/users.acl:ro
+    environment:
+      REDISCLI_AUTH: ${REDIS_ADMIN_PASSWORD:?set REDIS_ADMIN_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--user", "pitfs_admin", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    read_only: true
+    tmpfs:
+      - /data:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+
+  # Deploy-time step with the admin user: loads the registered Lua scripts, then exits.
+  redis-init:
+    build:
+      context: .
+    image: point-in-time-feature-store:local
+    command: ["load-scripts"]
+    environment:
+      REDIS_ADMIN_URL: redis://pitfs_admin:${REDIS_ADMIN_PASSWORD:?set REDIS_ADMIN_PASSWORD}@redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    build:
+      context: .
+    image: point-in-time-feature-store:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_LOG_LEVEL: INFO
+      APP_REDIS_URL: redis://redis:6379/0
+      APP_REDIS_USERNAME: pitfs_app
+      APP_REDIS_PASSWORD: ${APP_REDIS_PASSWORD:?set APP_REDIS_PASSWORD}
+      APP_LOG_HMAC_KEY: ${APP_LOG_HMAC_KEY:?set APP_LOG_HMAC_KEY}
+      APP_JWT_PUBLIC_KEY_PATH: /run/keys/jwt_public.pem
+      APP_RECEIPT_SIGNING_KEY_PATH: /run/keys/receipt_private.pem
+      # Comma-separated SHA-256 digests for /metrics; generate with `uv run pitfs generate-api-key`.
+      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+    volumes:
+      - ./var/keys:/run/keys:ro
+      - pitfs-data:/data
+    depends_on:
+      redis-init:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+
+volumes:
+  pitfs-data:

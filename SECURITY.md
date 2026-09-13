@@ -33,17 +33,20 @@ PII-tagged features without `pii:read`.
 
 - Threats, controls and the tests that prove them: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 - Every security claim is linked to evidence in [CLAIMS.md](CLAIMS.md).
-- Callers authenticate with EdDSA JWTs (public key only in the service); per-view read scopes,
-  `pii:read` for PII-tagged features, `entities:erase` for erasure.
+- Callers authenticate with EdDSA JWTs (public key only in the service; token lifetime capped at
+  one hour by default, since there is no revocation list); per-view read scopes, `pii:read` for
+  PII-tagged features, `entities:erase` for erasure.
 - No user-supplied SQL or code: transformations are a closed expression tree; DuckDB runs with
   external access disabled; SQL identifiers are validated and values are bound.
 - Redis runs with an ACL user that cannot flush, reconfigure, `EVAL` or `SCRIPT LOAD`; passwords
   come from the environment and appear in the ACL file only as SHA-256 digests.
 - Entity ids are HMAC-hashed in logs and receipts; PII values are HMAC-hashed in the request log.
-- Erasure receipts are signed with Ed25519; registry changes and feature reads are recorded in
-  hash-chained tables.
+  Erasure also scrubs the request-log SQLite file, and purge verification scans its raw bytes.
+- Erasure receipts are signed with Ed25519. Registry changes, feature reads and refused read or
+  erasure attempts are recorded in hash-chained tables; truncating or rebuilding a chain is
+  detected against Ed25519-signed anchors kept outside the database (`pitfs anchor-chains`).
 - CI runs ruff, mypy --strict, pytest with a coverage floor and a Redis service, bandit, semgrep
-  (registry packs plus `.semgrep/rules.yml`), pip-audit, gitleaks, hadolint, a trivy image scan and
-  a syft CycloneDX SBOM.
+  (registry packs plus `.semgrep/rules.yml`), pip-audit, gitleaks, hadolint, a trivy image scan,
+  a syft CycloneDX SBOM, and brings the compose stack up to check `/readyz` and an online read.
 - Secrets come only from the environment; only `.env.example` is committed.
 - Model artifacts use LightGBM's text format; pickle-family serialization is banned.

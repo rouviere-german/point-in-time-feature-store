@@ -4,14 +4,22 @@ Routes (all but the probes and ``/metrics`` need a bearer JWT):
 
 - ``POST /v1/features/online``: values, value timestamps and freshness for a batch of entities;
   views need ``features:read:<view>``; PII-tagged features need ``pii:read`` and are otherwise
-  omitted (listed under ``omitted``). Every read is appended to the access audit chain.
+  omitted (listed under ``omitted``).
 - ``DELETE /v1/entities/{entity_id}``: erase an entity everywhere (``entities:erase``); returns a
   signed receipt.
 - ``GET /v1/views``: active definitions without transformations (``registry:read``).
+
+Access audit: every authenticated read attempt is appended to the hash-chained access audit, a
+granted read as ``online_read`` and a refused one (403 or 422) as ``online_read_denied`` with the
+reason, the sanitised view names, the entity count and an HMAC digest of the batch; an erasure
+refused for a missing scope is recorded as ``erase_denied`` with the entity's HMAC. Requests
+without a valid token have no verified subject to record and only increment
+``auth_failures_total``, which also keeps unauthenticated floods from growing the chain.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Path, Request
@@ -36,6 +44,13 @@ from point_in_time_feature_store.serving.service import (
 __all__ = ["OnlineFeaturesRequest", "create_feature_app"]
 
 _log = get_logger("point_in_time_feature_store.api")
+_VIEW_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def _requested_views(features: list[str]) -> list[str]:
+    """View names of the feature references for the audit; malformed names are not echoed."""
+    names = {ref.split(":", 1)[0] for ref in features}
+    return sorted(name if _VIEW_NAME.fullmatch(name) else "<invalid>" for name in names)
 
 
 class OnlineFeaturesRequest(BaseModel):
@@ -96,21 +111,36 @@ def create_feature_app(services: FeatureStoreServices) -> FastAPI:
     def online_features(
         body: OnlineFeaturesRequest, request: Request, caller: CallerDep
     ) -> dict[str, Any]:
-        if len(body.entity_ids) > settings.online_max_batch_entities:
-            raise AppError(422, "batch_too_large", "Too many entity ids in one request.")
-        if len(body.features) > settings.online_max_features:
-            raise AppError(422, "too_many_features", "Too many feature references in one request.")
         request_id = request_id_of(request) or "unknown"
+        views = _requested_views(body.features)
+
+        def denied(status: int, code: str, message: str) -> AppError:
+            services.registry.record_access(
+                caller.subject,
+                "online_read_denied",
+                {
+                    "request_id": request_id,
+                    "reason": code,
+                    "views": list(views),
+                    "entity_count": len(body.entity_ids),
+                    "entities_digest": services.hasher.batch(body.entity_ids),
+                },
+            )
+            return AppError(status, code, message)
+
+        if len(body.entity_ids) > settings.online_max_batch_entities:
+            raise denied(422, "batch_too_large", "Too many entity ids in one request.")
+        if len(body.features) > settings.online_max_features:
+            raise denied(422, "too_many_features", "Too many feature references in one request.")
         service = services.online_service
         try:
             response = service.get(caller, body.entity_ids, body.features, request_id=request_id)
         except FeatureAccessDeniedError:
-            raise AppError(
+            raise denied(
                 403, "forbidden", "The caller may not read a requested feature view."
             ) from None
         except InvalidFeatureRequestError as exc:
-            raise AppError(422, "invalid_request", str(exc)) from None
-        views = sorted({ref.split(":", 1)[0] for ref in body.features})
+            raise denied(422, "invalid_request", str(exc)) from None
         services.registry.record_access(
             caller.subject,
             "online_read",
@@ -137,10 +167,20 @@ def create_feature_app(services: FeatureStoreServices) -> FastAPI:
 
     @app.delete("/v1/entities/{entity_id}")
     def erase_entity(
+        request: Request,
         caller: CallerDep,
         entity_id: Annotated[str, Path(min_length=1, max_length=128)],
     ) -> dict[str, Any]:
         if not caller.has(SCOPE_ERASE):
+            services.registry.record_access(
+                caller.subject,
+                "erase_denied",
+                {
+                    "request_id": request_id_of(request) or "unknown",
+                    "reason": "forbidden",
+                    "entity_hmac": services.hasher.entity(entity_id),
+                },
+            )
             raise AppError(403, "forbidden", "The caller may not erase entities.")
         repo = services.registry.active_repo()
         if not any(entity.is_valid_key(entity_id) for entity in repo.entities):

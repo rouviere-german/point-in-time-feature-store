@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -194,6 +195,42 @@ def test_access_is_audited_and_logs_carry_only_entity_hmacs(
     assert entry.actor == "svc-audit"
     assert entry.payload["entity_count"] == 3
     assert entry.payload["entities_digest"] == stack.services.hasher.batch(entities)
+    assert stack.services.registry.verify_chains()["access_audit"].ok
+
+
+def test_denied_reads_and_erasures_are_audited(client: TestClient, stack: LocalStack) -> None:
+    audit = stack.services.registry.access_audit
+    hasher = stack.services.hasher
+    narrow = stack.token(["features:read:session_stats"], subject="svc-narrow")
+    assert read(client, narrow, ACTIVE[:2], ["customer_profile:plan_tier"]).status_code == 403
+    denied = audit.entries()[-1]
+    assert denied.action == "online_read_denied"
+    assert denied.actor == "svc-narrow"
+    assert denied.payload == {
+        "request_id": denied.payload["request_id"],
+        "reason": "forbidden",
+        "views": ["customer_profile"],
+        "entity_count": 2,
+        "entities_digest": hasher.batch(ACTIVE[:2]),
+    }
+    assert read(client, narrow, ACTIVE[:6], ["session_stats:pages"]).status_code == 422
+    assert audit.entries()[-1].payload["reason"] == "batch_too_large"
+    wide = stack.token(["features:read:*"], subject="svc-wide")
+    assert read(client, wide, ACTIVE[:1], ["bogus view!:x"]).status_code == 422
+    invalid = audit.entries()[-1]
+    assert (invalid.actor, invalid.payload["reason"]) == ("svc-wide", "invalid_request")
+    assert invalid.payload["views"] == ["<invalid>"]
+
+    before = len(audit.entries())
+    assert client.delete(f"/v1/entities/{ACTIVE[0]}", headers=bearer(narrow)).status_code == 403
+    erase_denied = audit.entries()[-1]
+    assert len(audit.entries()) == before + 1
+    assert erase_denied.action == "erase_denied"
+    assert erase_denied.payload["entity_hmac"] == hasher.entity(ACTIVE[0])
+    assert read(client, None, ACTIVE[:1], ALL).status_code == 401
+    assert len(audit.entries()) == before + 1  # no verified subject: counted in metrics only
+    recorded = json.dumps([entry.payload for entry in audit.entries()])
+    assert all(entity not in recorded for entity in ACTIVE[:6])
     assert stack.services.registry.verify_chains()["access_audit"].ok
 
 

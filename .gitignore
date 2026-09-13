@@ -1,0 +1,44 @@
+# Secrets: only .env.example is committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.acl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Tool caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+sbom*.json
+requirements-audit.txt
+
+# Runtime state, artifacts and large generated data
+var/
+artifacts/
+data/generated/
+mlruns/
+*.parquet
+*.npz
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+bench/results/latest.json
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

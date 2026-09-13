@@ -1,0 +1,45 @@
+# Install: uvx pre-commit install
+# Third-party hooks are pinned to release tags; `uvx pre-commit autoupdate --freeze` pins them to
+# commit SHAs. Python tooling runs through `uv run`, so hook versions always match uv.lock.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.2
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+      - id: mypy
+        name: mypy --strict
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        types: [python]
+      - id: baseline
+        name: baseline check
+        entry: uv run python scripts/check_baseline.py
+        language: system
+        pass_filenames: false
+        always_run: true

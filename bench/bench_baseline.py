@@ -308,17 +308,41 @@ def bench_leakage(workdir: Path) -> Result:
         "customers_per_seed": 10_000,
         "holdout_rows_mean": round(statistics.fmean(r.rows["holdout"] for r in per_seed)),
     }
+
+    def ci_mean(arm: str, bound: int) -> float:
+        return round(statistics.fmean(r.arms[arm].gap_ci95[bound] for r in per_seed), 4)
+
     for arm in ("naive_latest", "event_time_asof", "pit"):
         output[f"{arm}_offline_auc_mean"] = mean(arm, "offline_auc")
         output[f"{arm}_holdout_auc_mean"] = mean(arm, "holdout_auc")
+        output[f"{arm}_period_control_auc_mean"] = mean(arm, "period_control_auc")
         output[f"{arm}_gap_mean"] = mean(arm, "gap")
+        output[f"{arm}_gap_ci95_low_mean"] = ci_mean(arm, 0)
+        output[f"{arm}_gap_ci95_high_mean"] = ci_mean(arm, 1)
     output["naive_gap_min"] = round(min(r.arms["naive_latest"].gap for r in per_seed), 4)
+    output["naive_gap_ci95_low_min"] = round(
+        min(r.arms["naive_latest"].gap_ci95[0] for r in per_seed), 4
+    )
     output["pit_gap_max"] = round(max(r.arms["pit"].gap for r in per_seed), 4)
     output["pit_abs_gap_mean"] = round(
         statistics.fmean(abs(r.arms["pit"].gap) for r in per_seed), 4
     )
+    # Seeds whose point-in-time gap interval contains 0 (no gap distinguishable from noise).
+    output["pit_gap_ci95_contains_zero_seeds"] = sum(
+        1 for r in per_seed if r.arms["pit"].gap_ci95[0] <= 0.0 <= r.arms["pit"].gap_ci95[1]
+    )
     output["per_seed"] = json.dumps(
-        [{arm: round(r.arms[arm].gap, 4) for arm in r.arms} for r in per_seed],
+        [
+            {
+                arm: {
+                    "gap": round(item.gap, 4),
+                    "ci95": [round(item.gap_ci95[0], 4), round(item.gap_ci95[1], 4)],
+                    "period_control_auc": round(item.period_control_auc, 4),
+                }
+                for arm, item in r.arms.items()
+            }
+            for r in per_seed
+        ],
         separators=(",", ":"),
     )
     return output

@@ -7,6 +7,13 @@ Label rows are taken every 14 days for active customers; the label is "churns wi
   validation customers' label rows in the same period, with features built by the arm's join.
 - *Holdout AUC*: score the holdout customers' label rows in a later period with point-in-time
   features, i.e. exactly what serving would have returned at those times.
+- *Period control AUC*: score the validation customers' label rows in the holdout period with
+  point-in-time features. Offline and holdout AUC differ in both the customers and the period;
+  this control shares the customers with the offline AUC and the period with the holdout AUC, so
+  it separates a difference between periods from a difference between customer splits.
+- *Gap CI*: a 95% percentile interval for the gap from a cluster bootstrap that resamples
+  customers (all label rows of a customer together, since they are correlated) in the validation
+  and holdout sets independently; every arm uses the same resamples.
 
 Arms: ``pit`` (the store's retrieval), ``naive_latest`` (latest row per entity in a data extract
 taken after the training period) and ``event_time_asof`` (ASOF on event time, blind to ingestion
@@ -87,6 +94,7 @@ class LeakageConfig:
     num_leaves: int = 15
     min_data_in_leaf: int = 40
     threads: int = 2
+    bootstrap_resamples: int = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +102,8 @@ class ArmResult:
     arm: str
     offline_auc: float
     holdout_auc: float
+    period_control_auc: float
+    gap_ci95: tuple[float, float]
     model_sha256: str
 
     @property
@@ -121,7 +131,9 @@ class LeakageResult:
                 name: {
                     "offline_auc": round(arm.offline_auc, 4),
                     "holdout_auc": round(arm.holdout_auc, 4),
+                    "period_control_auc": round(arm.period_control_auc, 4),
                     "gap": round(arm.gap, 4),
+                    "gap_ci95": [round(arm.gap_ci95[0], 4), round(arm.gap_ci95[1], 4)],
                 }
                 for name, arm in self.arms.items()
             },
@@ -210,8 +222,64 @@ def _train(
     )
 
 
-def _auc(model: lgb.Booster, x: FloatMatrix, y: npt.NDArray[np.int64]) -> float:
-    return float(roc_auc_score(y, np.asarray(model.predict(x), dtype=np.float64)))
+FloatVector = npt.NDArray[np.float64]
+IntVector = npt.NDArray[np.int64]
+
+
+@dataclass(frozen=True, slots=True)
+class _Scored:
+    """Labels, model scores and the customer (cluster) index of every label row."""
+
+    labels: IntVector
+    scores: FloatVector
+    groups: IntVector
+
+
+def _scores(model: lgb.Booster, x: FloatMatrix) -> FloatVector:
+    return np.asarray(model.predict(x), dtype=np.float64)
+
+
+def _auc(labels: IntVector, scores: FloatVector, weights: FloatVector | None = None) -> float:
+    return float(roc_auc_score(labels, scores, sample_weight=weights))
+
+
+def _groups(spine: pl.DataFrame) -> IntVector:
+    _, inverse = np.unique(spine["entity_id"].to_numpy(), return_inverse=True)
+    return np.asarray(inverse, dtype=np.int64)
+
+
+def _cluster_weights(groups: IntVector, rng: np.random.Generator) -> FloatVector:
+    clusters = int(groups.max()) + 1 if groups.size else 0
+    counts = np.bincount(rng.integers(0, clusters, size=clusters), minlength=clusters)
+    return np.asarray(counts[groups], dtype=np.float64)
+
+
+def _has_both_classes(labels: IntVector, weights: FloatVector) -> bool:
+    return bool(weights[labels == 1].sum() > 0 and weights[labels == 0].sum() > 0)
+
+
+def gap_ci95(
+    offline: _Scored, holdout: _Scored, *, resamples: int, seed: int
+) -> tuple[float, float]:
+    """95% percentile interval of ``AUC(offline) - AUC(holdout)`` under a customer bootstrap."""
+    rng = np.random.default_rng(seed)
+    gaps: list[float] = []
+    for _ in range(resamples):
+        w_offline = _cluster_weights(offline.groups, rng)
+        w_holdout = _cluster_weights(holdout.groups, rng)
+        if not (
+            _has_both_classes(offline.labels, w_offline)
+            and _has_both_classes(holdout.labels, w_holdout)
+        ):
+            continue
+        gaps.append(
+            _auc(offline.labels, offline.scores, w_offline)
+            - _auc(holdout.labels, holdout.scores, w_holdout)
+        )
+    if not gaps:
+        return (float("nan"), float("nan"))
+    low, high = np.percentile(np.asarray(gaps, dtype=np.float64), [2.5, 97.5])
+    return (float(low), float(high))
 
 
 def _arm_features(
@@ -281,10 +349,21 @@ def run_leakage_experiment(
         split="holdout",
         **common,
     )
+    control = build_label_spine(
+        dataset,
+        start_day=cfg.holdout_start_day,
+        end_day=cfg.holdout_end_day,
+        split="val",
+        **common,
+    )
     snapshot_us = dataset.config.day_us(cfg.snapshot_day)
     rows_cache: dict[str, pl.DataFrame] = {}
     x_hold, _ = model_matrix(retriever.get_historical_features(holdout, MODEL_FEATURES).frame)
     y_hold = _labels(holdout)
+    x_control, _ = model_matrix(retriever.get_historical_features(control, MODEL_FEATURES).frame)
+    y_control = _labels(control)
+    y_val = _labels(val)
+    groups_val, groups_hold = _groups(val), _groups(holdout)
     results: dict[str, ArmResult] = {}
     models: dict[str, str] = {}
     for arm in arms:
@@ -295,10 +374,16 @@ def run_leakage_experiment(
         model = _train(x_train, _labels(train), cfg, seed)
         text = model.model_to_string()
         models[arm] = text
+        scored_val = _Scored(y_val, _scores(model, x_val), groups_val)
+        scored_hold = _Scored(y_hold, _scores(model, x_hold), groups_hold)
         results[arm] = ArmResult(
             arm=arm,
-            offline_auc=_auc(model, x_val, _labels(val)),
-            holdout_auc=_auc(model, x_hold, y_hold),
+            offline_auc=_auc(scored_val.labels, scored_val.scores),
+            holdout_auc=_auc(scored_hold.labels, scored_hold.scores),
+            period_control_auc=_auc(y_control, _scores(model, x_control)),
+            gap_ci95=gap_ci95(
+                scored_val, scored_hold, resamples=cfg.bootstrap_resamples, seed=seed
+            ),
             model_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         )
     repo: FeatureRepo = retriever.repo
@@ -310,7 +395,12 @@ def run_leakage_experiment(
     result = LeakageResult(
         seed=seed,
         arms=results,
-        rows={"train": train.height, "val": val.height, "holdout": holdout.height},
+        rows={
+            "train": train.height,
+            "val": val.height,
+            "holdout": holdout.height,
+            "period_control": control.height,
+        },
         positive_rate=positives / total if total else 0.0,
         view_versions=view_versions,
         dataset_digest=digest,
@@ -376,7 +466,10 @@ def log_lineage(
         metrics += [
             Metric(f"{arm}.offline_auc", item.offline_auc, 0, 0),
             Metric(f"{arm}.holdout_auc", item.holdout_auc, 0, 0),
+            Metric(f"{arm}.period_control_auc", item.period_control_auc, 0, 0),
             Metric(f"{arm}.gap", item.gap, 0, 0),
+            Metric(f"{arm}.gap_ci95_low", item.gap_ci95[0], 0, 0),
+            Metric(f"{arm}.gap_ci95_high", item.gap_ci95[1], 0, 0),
         ]
     client.log_batch(
         run_id, metrics=metrics, params=[Param(key, value) for key, value in params.items()]

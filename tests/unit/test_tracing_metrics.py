@@ -25,10 +25,28 @@ def test_provider_records_spans_without_global_state() -> None:
     assert resource.attributes["service.name"] == "svc"
 
 
-def test_console_exporter_can_be_selected() -> None:
+def test_console_exporter_can_be_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ConsoleSpanExporter binds sys.stdout at import time, so capture its spans in memory instead.
+    created: list[InMemorySpanExporter] = []
+
+    def recording_console_exporter() -> InMemorySpanExporter:
+        exporter = InMemorySpanExporter()
+        created.append(exporter)
+        return exporter
+
+    monkeypatch.setattr(tracing, "ConsoleSpanExporter", recording_console_exporter)
+    quiet = build_tracer_provider("svc")
+    with quiet.get_tracer("t").start_as_current_span("unexported"):
+        pass
+    quiet.shutdown()
+    assert created == []
+
     provider = build_tracer_provider("svc", "console")
     with provider.get_tracer("t").start_as_current_span("work"):
         pass
+    assert provider.force_flush()
+    (exporter,) = created
+    assert [span.name for span in exporter.get_finished_spans()] == ["work"]
     provider.shutdown()
 
 

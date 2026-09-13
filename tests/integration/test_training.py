@@ -51,6 +51,20 @@ def test_naive_joins_leak_and_point_in_time_joins_do_not(retriever: HistoricalRe
     summary = result.summary()
     assert set(summary["arms"]) == {"pit", "naive_latest"}  # type: ignore[arg-type]
 
+    # The naive leak is far outside customer-resampling noise; intervals bracket their estimates.
+    assert naive.gap_ci95[0] > 0.05
+    for arm in (pit, naive):
+        low, high = arm.gap_ci95
+        assert low <= arm.gap <= high
+        assert high - low < 0.5
+    assert 0.5 < pit.period_control_auc < 1.0
+    arms_summary = summary["arms"]
+    assert isinstance(arms_summary, dict)
+    pit_summary = arms_summary["pit"]
+    assert isinstance(pit_summary, dict)
+    assert pit_summary["gap_ci95"] == [round(pit.gap_ci95[0], 4), round(pit.gap_ci95[1], 4)]
+    assert pit_summary["period_control_auc"] == round(pit.period_control_auc, 4)
+
 
 def test_training_is_deterministic_for_a_seed(retriever: HistoricalRetriever) -> None:
     first = run_leakage_experiment(DATASET, retriever, seed=4, arms=("pit",))

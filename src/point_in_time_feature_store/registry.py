@@ -56,6 +56,9 @@ _SCHEMA = (
     "erased_us INTEGER NOT NULL, receipt_id TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS training_runs (run_id TEXT PRIMARY KEY, model_name TEXT NOT NULL, "
     "created_us INTEGER NOT NULL, view_versions TEXT NOT NULL, dataset_digest TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS inflight_watermarks (view TEXT NOT NULL, "
+    "version_hash TEXT NOT NULL, target_us INTEGER NOT NULL, started_us INTEGER NOT NULL, "
+    "PRIMARY KEY (view, version_hash))",
 )
 
 
@@ -427,18 +430,48 @@ class FeatureRegistry:
         return None if row is None else int(row[0])
 
     def set_watermark(self, view: str, version: str, watermark_us: int) -> None:
+        """Commit a watermark and release the run's in-flight marker in one transaction."""
         with self._lock:
             current = self.get_watermark(view, version)
             if current is not None and watermark_us < current:
                 raise ValueError("watermarks never move backwards")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO watermarks (view, version_hash, watermark_us, "
+                    "updated_us) VALUES (?, ?, ?, ?)",
+                    (view, version, watermark_us, self._clock()),
+                )
+                self._conn.execute(
+                    "DELETE FROM inflight_watermarks WHERE view = ? AND version_hash = ? "
+                    "AND target_us <= ?",
+                    (view, version, watermark_us),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def begin_inflight(self, view: str, version: str, target_us: int) -> None:
+        """Record that a run up to ``target_us`` started; call it under the offline store lock."""
+        with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO watermarks (view, version_hash, watermark_us, updated_us) "
-                "VALUES (?, ?, ?, ?)",
-                (view, version, watermark_us, self._clock()),
+                "INSERT OR REPLACE INTO inflight_watermarks (view, version_hash, target_us, "
+                "started_us) VALUES (?, ?, ?, ?)",
+                (view, version, target_us, self._clock()),
+            )
+
+    def end_inflight(self, view: str, version: str, target_us: int) -> None:
+        """Release the marker of a run that failed before committing (if it is still that run's)."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM inflight_watermarks WHERE view = ? AND version_hash = ? "
+                "AND target_us = ?",
+                (view, version, target_us),
             )
 
     def max_watermark_for_source(self, source: str) -> int | None:
-        """Highest watermark of any active view over ``source`` (for the append-only check)."""
+        """Highest committed watermark of any active view over ``source``."""
         repo = self.active_repo()
         marks = [
             self.get_watermark(view.name, view.version_hash())
@@ -447,6 +480,32 @@ class FeatureRegistry:
         ]
         present = [mark for mark in marks if mark is not None]
         return max(present) if present else None
+
+    def knowledge_floor_for_source(self, source: str) -> int | None:
+        """Appends to ``source`` must carry ``ingested_at`` strictly above this value.
+
+        The floor is the highest committed watermark *or in-flight target* of any active view over
+        the source. A row at or below it would be visible offline but skipped by the run that has
+        already scanned, or is scanning, that window, i.e. silent skew. Appends read the floor
+        while holding the offline store lock, and a run registers its target under the same lock
+        before it scans, so no append can slip between the scan and the watermark commit.
+        """
+        repo = self.active_repo()
+        marks: list[int] = []
+        with self._lock:
+            for view in repo.feature_views:
+                if view.source != source:
+                    continue
+                version = view.version_hash()
+                row = self._conn.execute(
+                    "SELECT max(mark) FROM (SELECT watermark_us AS mark FROM watermarks "
+                    "WHERE view = ? AND version_hash = ? UNION ALL SELECT target_us AS mark "
+                    "FROM inflight_watermarks WHERE view = ? AND version_hash = ?)",
+                    (view.name, version, view.name, version),
+                ).fetchone()
+                if row is not None and row[0] is not None:
+                    marks.append(int(row[0]))
+        return max(marks) if marks else None
 
     # ----------------------------------------------------------------- erasure
     def add_tombstone(self, entity_hmac: str, receipt_id: str) -> None:

@@ -8,7 +8,11 @@ Layout under ``root``::
 Rows are partitioned by a stable hash of ``entity_id`` (SHA-256, first 4 bytes, modulo N), so all
 rows of one entity live in one bucket directory. Appends add new part files and never rewrite
 existing ones; erasure rewrites only the part files of that entity's bucket that contain it.
-Both take the same store lock, so an append cannot land between a tombstone and the rewrite.
+
+Concurrency: appends (validation, knowledge floor and tombstone checks, part writes), erasure
+rewrites and the start of a materialization run all take the same cross-process store lock
+(:meth:`OfflineStore.lock`). Values an append must check against the registry can be passed as
+callables, which are evaluated while the lock is held.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,6 +86,10 @@ class OfflineStore:
         self.buckets = buckets
         self._lock_path = root / "store"
 
+    def lock(self) -> contextlib.AbstractContextManager[None]:
+        """The store lock shared by appends, erasure rewrites and the start of materialization."""
+        return file_lock(self._lock_path)
+
     def bucket_of(self, entity_id: str) -> int:
         digest = hashlib.sha256(entity_id.encode("utf-8")).digest()
         return int.from_bytes(digest[:4], "big") % self.buckets
@@ -111,22 +119,33 @@ class OfflineStore:
         frame: pl.DataFrame,
         *,
         hasher: EntityHasher | None = None,
-        tombstones: frozenset[str] = frozenset(),
-        min_ingested_at_us: int | None = None,
+        tombstones: frozenset[str] | Callable[[], frozenset[str]] = frozenset(),
+        min_ingested_at_us: int | Callable[[], int | None] | None = None,
     ) -> AppendReport:
-        """Validate ``frame`` against the source contract, drop erased entities and write parts."""
-        validated = validate_source_frame(
-            source, entity, frame, min_ingested_at_us=min_ingested_at_us
-        )
-        with file_lock(self._lock_path):
+        """Validate ``frame`` against the source contract, drop erased entities and write parts.
+
+        Validation and writes happen under the store lock, and callable ``tombstones`` and
+        ``min_ingested_at_us`` are evaluated under it too:
+
+        - an erasure tombstones the entity and then rewrites under this lock, so an append that
+          reads tombstones under the lock either finished before the rewrite (whose files it then
+          cleans) or sees the tombstone; reading them earlier would resurrect erased rows;
+        - a materialization registers its target under this lock before scanning, so the run
+          either scans the new parts or its target is already part of the knowledge floor and
+          the rows it would miss are refused.
+        """
+        with self.lock():
+            floor = min_ingested_at_us() if callable(min_ingested_at_us) else min_ingested_at_us
+            validated = validate_source_frame(source, entity, frame, min_ingested_at_us=floor)
             dropped = 0
-            if tombstones:
+            erased_hmacs = tombstones() if callable(tombstones) else tombstones
+            if erased_hmacs:
                 if hasher is None:
                     raise ValueError("a hasher is required to honour tombstones")
                 erased = [
                     entity_id
                     for entity_id in validated["entity_id"].unique().to_list()
-                    if hasher.entity(entity_id) in tombstones
+                    if hasher.entity(entity_id) in erased_hmacs
                 ]
                 if erased:
                     before = validated.height

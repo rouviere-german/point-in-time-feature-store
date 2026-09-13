@@ -75,8 +75,9 @@ class FeatureStoreServices:
                 repo.entity(source.entity),
                 frame,
                 hasher=self.hasher,
-                tombstones=self.registry.tombstones(),
-                min_ingested_at_us=self.registry.max_watermark_for_source(source_name),
+                # Both are evaluated while the store lock is held (see OfflineStore.append).
+                tombstones=self.registry.tombstones,
+                min_ingested_at_us=lambda: self.registry.knowledge_floor_for_source(source_name),
             )
         except DataContractError as exc:
             for failure in exc.failures:

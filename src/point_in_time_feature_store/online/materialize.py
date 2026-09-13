@@ -10,6 +10,13 @@ checker verifies.
 
 Two-phase watermark: ``inflight`` is set before the writes and ``watermark`` committed after, so a
 reader that overlaps a run knows each entity is either at the old or at the new watermark.
+
+Concurrent appends: before scanning, a run records its target in the registry while holding the
+offline store lock. Appends read the knowledge floor (the highest committed watermark or in-flight
+target of the source's views) under the same lock, so an append either finished before the scan
+started (its parts are scanned) or refuses rows with ``ingested_at`` at or below the target, which
+the scan would miss. A run that fails before committing releases its target. One materializer per
+view at a time is assumed; runs of different views may overlap.
 """
 
 from __future__ import annotations
@@ -122,55 +129,66 @@ class Materializer:
         if previous is not None and target <= previous:
             return MaterializationReport(view.name, version, previous, previous, 0, 0, 0, 0, 0)
 
-        visible = pl.max_horizontal(
-            pl.col("event_time").dt.epoch("us"), pl.col("ingested_at").dt.epoch("us")
-        )
-        window = visible <= target
-        if previous is not None:
-            window = window & (visible > previous - overlap_us)
-        batch = self.store.scan(source).filter(window).collect()
+        # Register the target under the store lock *before* scanning (see the module docstring).
+        with self.store.lock():
+            self.registry.begin_inflight(view.name, version, target)
         try:
-            validate_source_frame(source, entity, batch)
-        except DataContractError as exc:
-            if self.metrics is not None:
-                for failure in exc.failures:
-                    self.metrics.contract_failures_total.labels(
-                        source.name, str(failure["check"])
-                    ).inc(int(failure["count"]))
-            raise
-
-        tombstones = self.registry.tombstones()
-        dropped = 0
-        if tombstones and batch.height:
-            erased = [
-                entity_id
-                for entity_id in batch["entity_id"].unique().to_list()
-                if self.hasher.entity(entity_id) in tombstones
-            ]
-            if erased:
-                before = batch.height
-                batch = batch.filter(~pl.col("entity_id").is_in(erased))
-                dropped = before - batch.height
-
-        rows = collect_feature_rows(view, batch.lazy())
-        winners = self.engine.latest_per_entity(rows, view.feature_names) if rows.height else rows
-        online_rows = [
-            OnlineRow(
-                entity_id=str(record[0]),
-                event_time_us=int(record[1]),
-                ingested_at_us=int(record[2]),
-                values=tuple(record[3:]),
+            visible = pl.max_horizontal(
+                pl.col("event_time").dt.epoch("us"), pl.col("ingested_at").dt.epoch("us")
             )
-            for record in winners.select(
-                "entity_id", "event_time", "ingested_at", *view.feature_names
-            ).iter_rows()
-        ]
-        self.online.begin_materialization(view.name, version, target)
-        stats = self.online.write_rows(view, version, online_rows)
-        if before_commit is not None:
-            before_commit()
-        self.online.commit_materialization(view.name, version, target)
-        self.registry.set_watermark(view.name, version, target)
+            window = visible <= target
+            if previous is not None:
+                window = window & (visible > previous - overlap_us)
+            batch = self.store.scan(source).filter(window).collect()
+            try:
+                validate_source_frame(source, entity, batch)
+            except DataContractError as exc:
+                if self.metrics is not None:
+                    for failure in exc.failures:
+                        self.metrics.contract_failures_total.labels(
+                            source.name, str(failure["check"])
+                        ).inc(int(failure["count"]))
+                raise
+
+            tombstones = self.registry.tombstones()
+            dropped = 0
+            if tombstones and batch.height:
+                erased = [
+                    entity_id
+                    for entity_id in batch["entity_id"].unique().to_list()
+                    if self.hasher.entity(entity_id) in tombstones
+                ]
+                if erased:
+                    before = batch.height
+                    batch = batch.filter(~pl.col("entity_id").is_in(erased))
+                    dropped = before - batch.height
+
+            rows = collect_feature_rows(view, batch.lazy())
+            winners = (
+                self.engine.latest_per_entity(rows, view.feature_names) if rows.height else rows
+            )
+            online_rows = [
+                OnlineRow(
+                    entity_id=str(record[0]),
+                    event_time_us=int(record[1]),
+                    ingested_at_us=int(record[2]),
+                    values=tuple(record[3:]),
+                )
+                for record in winners.select(
+                    "entity_id", "event_time", "ingested_at", *view.feature_names
+                ).iter_rows()
+            ]
+            self.online.begin_materialization(view.name, version, target)
+            stats = self.online.write_rows(view, version, online_rows)
+            if before_commit is not None:
+                before_commit()
+            self.online.commit_materialization(view.name, version, target)
+            self.registry.set_watermark(view.name, version, target)
+        except BaseException:
+            # Nothing was committed: a later run rescans from the previous watermark, so rows
+            # appended below this target from now on are safe to accept again.
+            self.registry.end_inflight(view.name, version, target)
+            raise
         if self.metrics is not None:
             self.metrics.materialization_lag_seconds.labels(view.name).set(
                 max(0.0, (self.clock() - target) / US_PER_SECOND)

@@ -210,6 +210,25 @@ def test_watermarks_tombstones_and_training_runs(registry: FeatureRegistry) -> N
     with pytest.raises(ValueError, match="backwards"):
         registry.set_watermark("transaction_stats", version, 49)
     assert registry.max_watermark_for_source("transactions") == 50
+    assert registry.knowledge_floor_for_source("transactions") == 50
+    assert registry.knowledge_floor_for_source("sessions") is None
+
+    # An in-flight run raises the knowledge floor before its watermark is committed.
+    registry.begin_inflight("transaction_stats", version, 80)
+    assert registry.max_watermark_for_source("transactions") == 50
+    assert registry.knowledge_floor_for_source("transactions") == 80
+    registry.end_inflight("transaction_stats", version, 79)  # another run's target: no effect
+    assert registry.knowledge_floor_for_source("transactions") == 80
+    registry.end_inflight("transaction_stats", version, 80)  # the run failed before committing
+    assert registry.knowledge_floor_for_source("transactions") == 50
+
+    # Committing clears the marker atomically; the floor never drops below the target.
+    registry.begin_inflight("transaction_stats", version, 90)
+    registry.set_watermark("transaction_stats", version, 90)
+    assert registry.max_watermark_for_source("transactions") == 90
+    assert registry.knowledge_floor_for_source("transactions") == 90
+    registry.end_inflight("transaction_stats", version, 90)
+    assert registry.knowledge_floor_for_source("transactions") == 90
     registry.add_tombstone("a" * 64, "receipt-1")
     registry.add_tombstone("a" * 64, "receipt-2")
     assert registry.tombstones() == frozenset({"a" * 64})

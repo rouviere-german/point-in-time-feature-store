@@ -23,7 +23,7 @@ from point_in_time_feature_store.offline.synthetic import (
 from point_in_time_feature_store.online.store import row_key
 from point_in_time_feature_store.services import FeatureStoreServices
 from point_in_time_feature_store.serving.auth import Caller
-from point_in_time_feature_store.timeutil import US_PER_DAY
+from point_in_time_feature_store.timeutil import US_PER_DAY, US_PER_SECOND
 
 pytestmark = pytest.mark.integration
 
@@ -160,6 +160,75 @@ def test_rows_behind_the_watermark_are_rejected_on_ingest(env: Env) -> None:
         "contract_failures_total", {"source": "transactions", "check": "knowledge_time_append_only"}
     )
     assert value == 2.0
+
+
+def _transaction_at(entity: str, event_us: int, ingested_us: int) -> pl.DataFrame:
+    def stamp(value: int) -> pl.Expr:
+        return pl.from_epoch(pl.lit(value), time_unit="us").dt.replace_time_zone("UTC")
+
+    template = DATASET.sources["transactions"].filter(pl.col("entity_id") == entity).head(1)
+    return template.with_columns(
+        stamp(event_us).alias("event_time"),
+        stamp(ingested_us).alias("ingested_at"),
+        pl.lit(4321.5).alias("amount"),
+    )
+
+
+def test_appends_during_an_inflight_materialization_are_refused_not_lost(env: Env) -> None:
+    """A row appended mid-run, behind the run's target, would never reach the online store."""
+    env.ingest(up_to=T1)
+    env.materialize(T1)
+    env.ingest(after=T1)
+    victim = next(
+        entity
+        for entity in entity_ids(200)
+        if DATASET.sources["transactions"].filter(pl.col("entity_id") == entity).height
+    )
+    outcome: dict[str, object] = {}
+
+    def append_mid_run() -> None:
+        late = _transaction_at(victim, T2 - 2 * US_PER_SECOND, T2 - US_PER_SECOND)
+        try:
+            env.services.ingest("transactions", late)
+            outcome["accepted"] = True
+        except DataContractError as exc:
+            outcome["checks"] = {item["check"] for item in exc.failures}
+
+    env.services.materializer.materialize(
+        "transaction_stats", up_to_us=T2, before_commit=append_mid_run
+    )
+    assert outcome == {"checks": {"knowledge_time_append_only"}}
+
+    # After the commit, appends beyond the new watermark are accepted and reach the online store.
+    later = T2 + US_PER_DAY
+    env.stack.clock.now_us = later
+    fresh = _transaction_at(victim, later - 2 * US_PER_SECOND, later - US_PER_SECOND)
+    assert env.services.ingest("transactions", fresh).rows_written == 1
+    env.services.materializer.materialize("transaction_stats", up_to_us=later)
+    env.serve([victim], [later])
+    report = env.services.skew_checker().check(sample_size=100, seed=0)
+    assert report.checked > 0
+    assert report.mismatches == 0
+    served = env.services.request_log.sample(100, seed=0)
+    assert any(read.event_time_us == later - 2 * US_PER_SECOND for read in served)
+
+
+def test_a_failed_materialization_releases_its_knowledge_floor(env: Env) -> None:
+    env.ingest(up_to=T1)
+    env.materialize(T1)
+    assert env.services.registry.knowledge_floor_for_source("transactions") == T1
+
+    def fail() -> None:
+        assert env.services.registry.knowledge_floor_for_source("transactions") == T2
+        raise RuntimeError("simulated crash before the commit")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        env.services.materializer.materialize("transaction_stats", up_to_us=T2, before_commit=fail)
+    assert env.services.registry.knowledge_floor_for_source("transactions") == T1
+    env.ingest(after=T1)
+    env.materialize(T2)
+    env.serve(entity_ids(20), [T2] * 10)
+    assert env.services.skew_checker().check(sample_size=1_000, seed=0).mismatches == 0
 
 
 def test_tombstoned_entities_are_not_materialized(env: Env) -> None:

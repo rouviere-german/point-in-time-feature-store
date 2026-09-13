@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
 
+from point_in_time_feature_store.core.fileio import file_lock
 from point_in_time_feature_store.definitions import FeatureDefinition
 from point_in_time_feature_store.devtools import LocalStack, build_local_stack
 from point_in_time_feature_store.dsl import DType, col
 from point_in_time_feature_store.erasure import ReceiptSigner, verify_receipt
+from point_in_time_feature_store.offline import store as store_module
 from point_in_time_feature_store.offline.synthetic import (
     SyntheticConfig,
     churn_feature_repo,
@@ -147,6 +151,44 @@ def test_erased_entities_do_not_come_back(stack: LocalStack) -> None:
     assert frame.select(pl.all().exclude("entity_id", "label_time").is_null().all()).row(
         0
     ) == tuple([True] * (frame.width - 2))
+
+
+def test_an_erasure_racing_an_append_does_not_resurrect_the_entity(
+    stack: LocalStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tombstones must be read under the store lock, or an append that raced the erasure (read
+    tombstones, then waited for the lock the rewrite held) writes the erased rows back."""
+    services = stack.services
+    victim = victim_with_every_source()
+    later = T2 + US_PER_DAY
+    stack.clock.now_us = later
+    replay = (
+        DATASET.sources["transactions"]
+        .filter(pl.col("entity_id") == victim)
+        .filter(pl.col("event_time").dt.epoch("us") > later - 399 * US_PER_DAY)
+        .with_columns(
+            pl.from_epoch(pl.lit(later), time_unit="us")
+            .dt.replace_time_zone("UTC")
+            .alias("ingested_at")
+        )
+    )
+    assert replay.height > 0
+    erased: list[bool] = []
+
+    @contextlib.contextmanager
+    def erase_then_lock(path: Path, **kwargs: Any) -> Iterator[None]:
+        if not erased:
+            erased.append(True)
+            services.erasure.erase(victim, requested_by="privacy-desk")
+        with file_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(store_module, "file_lock", erase_then_lock)
+    report = services.ingest("transactions", replay)
+    assert erased
+    assert report.rows_written == 0
+    assert report.rows_dropped_tombstoned == replay.height
+    assert services.erasure.verify_purged(victim).clean
 
 
 def test_purge_verification_scans_raw_storage_bytes(stack: LocalStack) -> None:

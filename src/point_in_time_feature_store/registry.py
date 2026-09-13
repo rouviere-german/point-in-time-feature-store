@@ -40,6 +40,7 @@ __all__ = [
 ]
 
 ObjectKind = Literal["entity", "source", "feature_view"]
+_SIDE_FILES = ("-wal", "-journal")
 _KINDS: tuple[ObjectKind, ...] = ("entity", "source", "feature_view")
 
 _SCHEMA = (
@@ -231,6 +232,11 @@ class FeatureRegistry:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def storage_files(self) -> list[Path]:
+        """The database file and its WAL/journal side files that currently exist on disk."""
+        candidates = [self.path, *(self.path.with_name(self.path.name + s) for s in _SIDE_FILES)]
+        return [path for path in candidates if path.exists()]
 
     # ----------------------------------------------------------------- definitions
     def active_repo(self) -> FeatureRepo:

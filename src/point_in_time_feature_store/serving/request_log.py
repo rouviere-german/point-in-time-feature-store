@@ -36,6 +36,7 @@ _SCHEMA = (
     "status TEXT NOT NULL, event_time_us INTEGER, vals TEXT NOT NULL)"
 )
 _INDEX = "CREATE INDEX IF NOT EXISTS request_log_entity ON request_log (entity_id)"
+_SIDE_FILES = ("-wal", "-journal")
 
 
 def _hmac_input(value: Value) -> str:
@@ -78,11 +79,14 @@ class RequestLog:
         if not 0.0 <= sample_rate <= 1.0:
             raise ValueError("sample_rate must be within [0, 1]")
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self.sample_rate = sample_rate
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # Deleted cells and freed pages are overwritten with zeros instead of lingering on disk.
+        self._conn.execute("PRAGMA secure_delete=ON")
         self._conn.execute(_SCHEMA)
         self._conn.execute(_INDEX)
 
@@ -173,7 +177,28 @@ class RequestLog:
             ).fetchone()
         return int(row[0])
 
+    def storage_files(self) -> list[Path]:
+        """The database file and its WAL/journal side files that currently exist on disk."""
+        candidates = [self.path, *(self.path.with_name(self.path.name + s) for s in _SIDE_FILES)]
+        return [path for path in candidates if path.exists()]
+
     def delete_entity(self, entity_id: str) -> int:
+        """Delete an entity's rows and scrub them from the files, not only from the table.
+
+        ``secure_delete`` zeroes the deleted cells; the WAL still holds the frames that inserted
+        them, so it is checkpointed and truncated, and ``VACUUM`` rebuilds the file without free
+        pages. Filesystem-level remnants (journaling, SSD wear levelling, snapshots) are out of
+        reach of SQLite and are documented in the threat model.
+        """
         with self._lock:
             cursor = self._conn.execute("DELETE FROM request_log WHERE entity_id = ?", (entity_id,))
-            return int(cursor.rowcount)
+            deleted = int(cursor.rowcount)
+            self._checkpoint()
+            self._conn.execute("VACUUM")
+            self._checkpoint()
+            return deleted
+
+    def _checkpoint(self) -> None:
+        busy, _, _ = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if int(busy):
+            raise RuntimeError("request log checkpoint was blocked by another connection")

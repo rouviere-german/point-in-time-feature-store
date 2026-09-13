@@ -7,13 +7,15 @@ Order of operations for ``erase(entity_id)``:
 2. rewrite every Parquet part file of every source that contains the entity (before/after SHA-256
    recorded; a part left empty is deleted);
 3. delete the entity's online hashes for every version of every view ever applied;
-4. delete its request-log rows;
+4. delete its request-log rows and scrub the SQLite files (secure delete, WAL checkpoint and
+   truncation, ``VACUUM``), so the id is gone from the bytes on disk, not only from the table;
 5. append an ``erase_entity`` entry to the hash-chained change log;
 6. sign a receipt over the canonical JSON of all of the above.
 
 The receipt carries the entity's HMAC, never the id. Application logs only ever carry HMACs, so
-there is nothing to purge there; :meth:`ErasureService.verify_purged` checks all stores (and any
-captured log text) for residue.
+there is nothing to purge there; :meth:`ErasureService.verify_purged` checks all stores through
+their query interfaces, scans the raw bytes of the request-log and registry SQLite files (including
+WAL and journal files) for the id, and scans any captured log text.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -44,6 +47,7 @@ __all__ = [
     "OfflineRewrite",
     "PurgeReport",
     "ReceiptSigner",
+    "count_raw_occurrences",
     "public_key_id",
     "verify_receipt",
 ]
@@ -113,12 +117,37 @@ def verify_receipt(receipt: ErasureReceipt, public_key: Ed25519PublicKey) -> boo
     return True
 
 
+_SCAN_CHUNK_BYTES = 1 << 20
+
+
+def count_raw_occurrences(paths: Iterable[Path], needle: bytes) -> int:
+    """Occurrences of ``needle`` in the raw bytes of ``paths``, read in overlapping chunks."""
+    if not needle:
+        return 0
+    keep = len(needle) - 1
+    total = 0
+    for path in paths:
+        try:
+            handle = path.open("rb")
+        except FileNotFoundError:
+            continue
+        with handle:
+            tail = b""
+            while chunk := handle.read(_SCAN_CHUNK_BYTES):
+                window = tail + chunk
+                total += window.count(needle)
+                # The tail is shorter than the needle, so no occurrence is counted twice.
+                tail = window[-keep:] if keep else b""
+    return total
+
+
 @dataclass(slots=True)
 class PurgeReport:
     offline_rows: dict[str, int] = field(default_factory=dict)
     online_keys: int = 0
     request_log_rows: int = 0
     log_occurrences: int = 0
+    storage_occurrences: int = 0
 
     @property
     def clean(self) -> bool:
@@ -127,6 +156,7 @@ class PurgeReport:
             and self.online_keys == 0
             and self.request_log_rows == 0
             and self.log_occurrences == 0
+            and self.storage_occurrences == 0
         )
 
 
@@ -213,6 +243,10 @@ class ErasureService:
             online_keys=self.online.count_entity_keys(entity_id, self.registry.view_versions()),
             request_log_rows=self.request_log.count_entity(entity_id),
             log_occurrences=sum(text.count(entity_id) for text in log_texts),
+            storage_occurrences=count_raw_occurrences(
+                [*self.request_log.storage_files(), *self.registry.storage_files()],
+                entity_id.encode("utf-8"),
+            ),
         )
 
 

@@ -12,6 +12,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from point_in_time_feature_store import erasure
 from point_in_time_feature_store.catalog import render_catalog
 from point_in_time_feature_store.hashing import EntityHasher
 from point_in_time_feature_store.monitoring import FeatureDriftMonitor, create_feature_store_metrics
@@ -129,4 +130,49 @@ def test_request_log_sampling_storage_and_erasure(tmp_path: Path) -> None:
     assert log.delete_entity("c1") == 5
     assert log.count_entity("c1") == 0
     assert "a@example.com" not in (tmp_path / "log.sqlite").read_bytes().decode("latin-1")
+    log.close()
+
+
+def test_raw_occurrence_scan_counts_across_chunk_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(erasure, "_SCAN_CHUNK_BYTES", 7)
+    data = tmp_path / "blob.bin"
+    data.write_bytes(b"xxxxxc000123yyc000123c000123zz" * 3)
+    assert erasure.count_raw_occurrences([data, tmp_path / "missing"], b"c000123") == 9
+    assert erasure.count_raw_occurrences([data], b"") == 0
+    assert erasure.count_raw_occurrences([data], b"x") == 15
+
+
+def _raw_bytes(directory: Path, stem: str) -> bytes:
+    return b"".join(path.read_bytes() for path in sorted(directory.glob(f"{stem}*")))
+
+
+def test_request_log_erasure_leaves_no_raw_bytes_on_disk(tmp_path: Path) -> None:
+    """A SQL DELETE leaves deleted cells in free pages and the WAL; erasure must scrub them."""
+    log = RequestLog(tmp_path / "log.sqlite", sample_rate=1.0)
+    view = churn_feature_repo().view("session_stats")
+    victim = "victimEntity0042"
+    reads = [
+        LoggedRead(
+            f"r{i}",
+            i,
+            victim if i % 3 == 0 else f"other{i:05d}",
+            view.name,
+            "v" * 64,
+            None,
+            None,
+            "ok",
+            i,
+            {"pages": i},
+        )
+        for i in range(600)
+    ]
+    log.record(reads)
+    assert victim.encode("utf-8") in _raw_bytes(tmp_path, "log.sqlite")
+    assert log.delete_entity(victim) == 200
+    assert log.count_entity(victim) == 0
+    assert log.count() == 400
+    assert _raw_bytes(tmp_path, "log.sqlite").count(victim.encode("utf-8")) == 0
+    assert b"other00001" in _raw_bytes(tmp_path, "log.sqlite")
     log.close()

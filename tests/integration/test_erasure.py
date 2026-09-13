@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -146,6 +147,31 @@ def test_erased_entities_do_not_come_back(stack: LocalStack) -> None:
     assert frame.select(pl.all().exclude("entity_id", "label_time").is_null().all()).row(
         0
     ) == tuple([True] * (frame.width - 2))
+
+
+def test_purge_verification_scans_raw_storage_bytes(stack: LocalStack) -> None:
+    """Residue that SQL cannot see (a plain DELETE into free pages and the WAL) is reported."""
+    services = stack.services
+    victim = victim_with_every_source()
+    services.online_service.get(READER, [victim], ALL, request_id=uuid.uuid4().hex, now_us=T2)
+    services.erasure.erase(victim, requested_by="privacy-desk")
+    clean = services.erasure.verify_purged(victim)
+    assert clean.clean
+    assert clean.storage_occurrences == 0
+
+    log_path = services.settings.data_dir / "request_log.sqlite"
+    with sqlite3.connect(log_path) as connection:
+        connection.execute("PRAGMA secure_delete=OFF")
+        connection.execute(
+            "INSERT INTO request_log (request_id, ts_us, entity_id, view, version_hash, status, "
+            "vals) VALUES ('bypass', 1, ?, 'session_stats', 'v', 'ok', '{}')",
+            (victim,),
+        )
+        connection.execute("DELETE FROM request_log WHERE request_id = 'bypass'")
+    residue = services.erasure.verify_purged(victim)
+    assert residue.request_log_rows == 0
+    assert residue.storage_occurrences > 0
+    assert not residue.clean
 
 
 def test_purge_verification_reports_log_residue(stack: LocalStack) -> None:
